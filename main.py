@@ -3,7 +3,9 @@ import secrets
 import hashlib
 import base64
 import json
+
 from email.utils import parseaddr
+from email.message import EmailMessage
 
 from fastapi import FastAPI, Request
 from fastapi.responses import RedirectResponse
@@ -16,9 +18,9 @@ from googleapiclient.discovery import build
 app = FastAPI(title="Residency Pre-Pilot Backend")
 
 
-# ---------------------------------------------------------
+# =========================================================
 # Environment Variables
-# ---------------------------------------------------------
+# =========================================================
 
 GOOGLE_CLIENT_ID = os.environ["GOOGLE_CLIENT_ID"]
 GOOGLE_CLIENT_SECRET = os.environ["GOOGLE_CLIENT_SECRET"]
@@ -30,9 +32,9 @@ RESIDENT_REGISTRY_SPREADSHEET_ID = os.environ[
 ]
 
 
-# ---------------------------------------------------------
+# =========================================================
 # Google API Scopes
-# ---------------------------------------------------------
+# =========================================================
 
 SCOPES = [
     "https://www.googleapis.com/auth/gmail.modify",
@@ -40,9 +42,9 @@ SCOPES = [
 ]
 
 
-# ---------------------------------------------------------
-# OAuth
-# ---------------------------------------------------------
+# =========================================================
+# Google Authentication
+# =========================================================
 
 def create_flow():
     client_config = {
@@ -74,18 +76,32 @@ def get_google_credentials():
     )
 
 
-# ---------------------------------------------------------
-# Resident Registry
-# ---------------------------------------------------------
+# =========================================================
+# Google Services
+# =========================================================
 
-def get_residents():
-    credentials = get_google_credentials()
+def get_gmail_service():
+    return build(
+        "gmail",
+        "v1",
+        credentials=get_google_credentials()
+    )
 
-    sheets = build(
+
+def get_sheets_service():
+    return build(
         "sheets",
         "v4",
-        credentials=credentials
+        credentials=get_google_credentials()
     )
+
+
+# =========================================================
+# Resident Registry
+# =========================================================
+
+def get_residents():
+    sheets = get_sheets_service()
 
     result = (
         sheets.spreadsheets()
@@ -106,10 +122,22 @@ def get_residents():
             continue
 
         residents.append({
-            "resident_id": row[0].strip() if len(row) > 0 else "",
-            "name": row[1].strip() if len(row) > 1 else "",
-            "email": row[2].strip().lower() if len(row) > 2 else "",
-            "active": row[3].strip().upper() if len(row) > 3 else ""
+            "resident_id": (
+                row[0].strip()
+                if len(row) > 0 else ""
+            ),
+            "name": (
+                row[1].strip()
+                if len(row) > 1 else ""
+            ),
+            "email": (
+                row[2].strip().lower()
+                if len(row) > 2 else ""
+            ),
+            "active": (
+                row[3].strip().upper()
+                if len(row) > 3 else ""
+            )
         })
 
     return residents
@@ -118,9 +146,8 @@ def get_residents():
 def authorize_sender(sender_email):
     normalized_email = sender_email.strip().lower()
 
-    residents = get_residents()
+    for resident in get_residents():
 
-    for resident in residents:
         if resident["email"] == normalized_email:
 
             if resident["active"] == "TRUE":
@@ -142,9 +169,124 @@ def authorize_sender(sender_email):
     }
 
 
-# ---------------------------------------------------------
+# =========================================================
+# Gmail Helpers
+# =========================================================
+
+def get_latest_inbox_message():
+    gmail = get_gmail_service()
+
+    result = (
+        gmail.users()
+        .messages()
+        .list(
+            userId="me",
+            labelIds=["INBOX"],
+            maxResults=1
+        )
+        .execute()
+    )
+
+    messages = result.get("messages", [])
+
+    if not messages:
+        return None
+
+    message_id = messages[0]["id"]
+
+    message = (
+        gmail.users()
+        .messages()
+        .get(
+            userId="me",
+            id=message_id,
+            format="metadata",
+            metadataHeaders=[
+                "From",
+                "To",
+                "Subject",
+                "Date",
+                "Message-ID"
+            ]
+        )
+        .execute()
+    )
+
+    headers = {
+        header["name"].lower(): header["value"]
+        for header in message
+        .get("payload", {})
+        .get("headers", [])
+    }
+
+    sender_name, sender_email = parseaddr(
+        headers.get("from", "")
+    )
+
+    return {
+        "message_id": message_id,
+        "thread_id": message.get("threadId"),
+        "sender_name": sender_name,
+        "sender_email": sender_email.strip().lower(),
+        "subject": headers.get("subject", ""),
+        "date": headers.get("date", ""),
+        "rfc_message_id": headers.get("message-id", "")
+    }
+
+
+def send_decline_reply(message):
+    gmail = get_gmail_service()
+
+    original_subject = message["subject"]
+
+    if original_subject.lower().startswith("re:"):
+        reply_subject = original_subject
+    else:
+        reply_subject = f"Re: {original_subject}"
+
+    body = (
+        "Thank you for contacting The Tech Residency Program.\n\n"
+        "This email address is not currently authorized to interact "
+        "with the Residency system. If you believe this is an error, "
+        "please contact the Residency Program coordinator using your "
+        "registered email address.\n\n"
+        "The Tech Residency Program"
+    )
+
+    email_message = EmailMessage()
+
+    email_message["To"] = message["sender_email"]
+    email_message["Subject"] = reply_subject
+
+    if message["rfc_message_id"]:
+        email_message["In-Reply-To"] = message["rfc_message_id"]
+        email_message["References"] = message["rfc_message_id"]
+
+    email_message.set_content(body)
+
+    encoded_message = base64.urlsafe_b64encode(
+        email_message.as_bytes()
+    ).decode()
+
+    sent_message = (
+        gmail.users()
+        .messages()
+        .send(
+            userId="me",
+            body={
+                "raw": encoded_message,
+                "threadId": message["thread_id"]
+            }
+        )
+        .execute()
+    )
+
+    return sent_message
+
+
+# =========================================================
 # Basic Endpoints
-# ---------------------------------------------------------
+# =========================================================
 
 @app.get("/")
 def home():
@@ -161,9 +303,9 @@ def health():
     }
 
 
-# ---------------------------------------------------------
-# Google Authorization
-# ---------------------------------------------------------
+# =========================================================
+# OAuth
+# =========================================================
 
 @app.get("/auth/google")
 def google_auth():
@@ -242,23 +384,18 @@ def oauth_callback(request: Request):
         "refresh_token_received": bool(
             credentials.refresh_token
         ),
-        "message": "Google authorization completed successfully."
+        "message":
+            "Google authorization completed successfully."
     }
 
 
-# ---------------------------------------------------------
-# Gmail Connection Test
-# ---------------------------------------------------------
+# =========================================================
+# Connectivity Tests
+# =========================================================
 
 @app.get("/test/gmail")
 def test_gmail():
-    credentials = get_google_credentials()
-
-    gmail = build(
-        "gmail",
-        "v1",
-        credentials=credentials
-    )
+    gmail = get_gmail_service()
 
     profile = (
         gmail.users()
@@ -274,10 +411,6 @@ def test_gmail():
     }
 
 
-# ---------------------------------------------------------
-# Resident Registry Test
-# ---------------------------------------------------------
-
 @app.get("/test/residents")
 def test_residents():
     residents = get_residents()
@@ -289,77 +422,68 @@ def test_residents():
     }
 
 
-# ---------------------------------------------------------
-# Latest Inbox Message + Authorization Test
-# ---------------------------------------------------------
+# =========================================================
+# Latest Email Authorization Test
+# =========================================================
 
 @app.get("/test/latest-email")
 def test_latest_email():
-    credentials = get_google_credentials()
+    message = get_latest_inbox_message()
 
-    gmail = build(
-        "gmail",
-        "v1",
-        credentials=credentials
-    )
-
-    result = (
-        gmail.users()
-        .messages()
-        .list(
-            userId="me",
-            labelIds=["INBOX"],
-            maxResults=1
-        )
-        .execute()
-    )
-
-    messages = result.get("messages", [])
-
-    if not messages:
+    if not message:
         return {
             "status": "no_inbox_messages"
         }
 
-    message_id = messages[0]["id"]
-
-    message = (
-        gmail.users()
-        .messages()
-        .get(
-            userId="me",
-            id=message_id,
-            format="metadata",
-            metadataHeaders=[
-                "From",
-                "Subject",
-                "Date"
-            ]
-        )
-        .execute()
+    authorization = authorize_sender(
+        message["sender_email"]
     )
-
-    headers = {
-        header["name"].lower(): header["value"]
-        for header in message
-        .get("payload", {})
-        .get("headers", [])
-    }
-
-    raw_from = headers.get("from", "")
-
-    sender_name, sender_email = parseaddr(raw_from)
-
-    sender_email = sender_email.strip().lower()
-
-    authorization = authorize_sender(sender_email)
 
     return {
         "status": "email_checked",
-        "message_id": message_id,
-        "sender_name": sender_name,
-        "sender_email": sender_email,
-        "subject": headers.get("subject", ""),
-        "date": headers.get("date", ""),
+        **message,
         "authorization": authorization
+    }
+
+
+# =========================================================
+# Manual Processing Test
+# =========================================================
+
+@app.get("/test/process-latest-email")
+def process_latest_email():
+    message = get_latest_inbox_message()
+
+    if not message:
+        return {
+            "status": "no_inbox_messages"
+        }
+
+    authorization = authorize_sender(
+        message["sender_email"]
+    )
+
+    # Authorized resident:
+    # Do not send anything yet.
+    if authorization["authorized"]:
+        return {
+            "status": "authorized",
+            "action": "none",
+            "message_id": message["message_id"],
+            "sender_email": message["sender_email"],
+            "resident": authorization
+        }
+
+    # Unauthorized/inactive sender:
+    # Fixed deterministic decline reply.
+    sent_message = send_decline_reply(message)
+
+    return {
+        "status": "unauthorized",
+        "action": "decline_sent",
+        "message_id": message["message_id"],
+        "sender_email": message["sender_email"],
+        "internal_reason": authorization["reason"],
+        "sent_message_id": sent_message.get("id"),
+        "thread_id": sent_message.get("threadId")
     }
