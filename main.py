@@ -511,3 +511,35 @@ async def gmail_pubsub_webhook(request: Request):
         return {
             "status": "notification_received"
         }
+
+# =========================================================
+# Start Gmail Inbox Watch
+# =========================================================
+
+@app.get("/test/start-gmail-watch")
+def start_gmail_watch():
+    gmail = get_gmail_service()
+
+    request_body = {
+        "topicName": (
+            "projects/residency-prepilot/"
+            "topics/gmail-residency-inbox"
+        ),
+        "labelIds": ["INBOX"],
+        "labelFilterBehavior": "INCLUDE"
+    }
+
+    result = (
+        gmail.users()
+        .watch(
+            userId="me",
+            body=request_body
+        )
+        .execute()
+    )
+
+    return {
+        "status": "gmail_watch_started",
+        "history_id": result.get("historyId"),
+        "expiration": result.get("expiration")
+    }
