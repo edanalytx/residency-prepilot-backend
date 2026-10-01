@@ -54,7 +54,7 @@ RESIDENT_REGISTRY_SPREADSHEET_ID = os.environ[
 
 SCOPES = [
     "https://www.googleapis.com/auth/gmail.modify",
-    "https://www.googleapis.com/auth/spreadsheets.readonly"
+    "https://www.googleapis.com/auth/spreadsheets"
 ]
 
 
@@ -114,7 +114,26 @@ def get_sheets_service():
 
 # =========================================================
 # Resident Registry
+# Sheet structure:
+#
+# A = Resident_ID
+# B = Name
+# C = Email
+# D = Status
+# E = Counter
+# F = Mentor
 # =========================================================
+
+VALID_RESIDENT_STATUSES = {
+    "JOINED",
+    "PENDING",
+    "READY",
+    "ACTIVE",
+    "SUBMITTED",
+    "INACTIVE",
+    "DEAD",
+}
+
 
 def get_residents():
     sheets = get_sheets_service()
@@ -124,7 +143,7 @@ def get_residents():
         .values()
         .get(
             spreadsheetId=RESIDENT_REGISTRY_SPREADSHEET_ID,
-            range="Approved_Residents!A:D"
+            range="Approved_Residents!A:F"
         )
         .execute()
     )
@@ -133,52 +152,186 @@ def get_residents():
 
     residents = []
 
-    for row in rows[1:]:
+    for sheet_row, row in enumerate(
+        rows[1:],
+        start=2
+    ):
         if not row:
             continue
 
-        residents.append({
-            "resident_id": (
-                row[0].strip()
-                if len(row) > 0 else ""
-            ),
-            "name": (
-                row[1].strip()
-                if len(row) > 1 else ""
-            ),
-            "email": (
-                row[2].strip().lower()
-                if len(row) > 2 else ""
-            ),
-            "active": (
-                row[3].strip().upper()
-                if len(row) > 3 else ""
+        resident_id = (
+            row[0].strip()
+            if len(row) > 0
+            else ""
+        )
+
+        name = (
+            row[1].strip()
+            if len(row) > 1
+            else ""
+        )
+
+        email_address = (
+            row[2].strip().lower()
+            if len(row) > 2
+            else ""
+        )
+
+        status = (
+            row[3].strip().upper()
+            if len(row) > 3
+            else ""
+        )
+
+        counter_raw = (
+            row[4].strip()
+            if len(row) > 4
+            else ""
+        )
+
+        mentor = (
+            row[5].strip().lower()
+            if len(row) > 5
+            else ""
+        )
+
+        try:
+            counter = (
+                int(counter_raw)
+                if counter_raw != ""
+                else None
             )
+        except ValueError:
+            counter = None
+
+        residents.append({
+            "resident_id": resident_id,
+            "name": name,
+            "email": email_address,
+            "status": status,
+            "counter": counter,
+            "mentor": mentor,
+            "sheet_row": sheet_row
         })
 
     return residents
 
 
-def authorize_sender(sender_email):
-    normalized_email = sender_email.strip().lower()
+def get_resident_by_email(sender_email):
+    normalized_email = (
+        sender_email
+        .strip()
+        .lower()
+    )
 
     for resident in get_residents():
 
         if (
-            resident["email"] == normalized_email
-            and resident["active"] == "TRUE"
+            resident["email"]
+            == normalized_email
         ):
-            return {
-                "authorized": True,
-                "resident_id": resident["resident_id"],
-                "name": resident["name"],
-                "email": resident["email"]
-            }
+            return resident
 
-    # Not listed, FALSE, inactive, blank, etc.
-    # All are treated identically.
+    return None
+
+
+def authorize_sender(sender_email):
+    resident = get_resident_by_email(
+        sender_email
+    )
+
+    if resident is None:
+        return {
+            "authorized": False
+        }
+
     return {
-        "authorized": False
+        "authorized": True,
+        "resident_id":
+            resident["resident_id"],
+        "name":
+            resident["name"],
+        "email":
+            resident["email"],
+        "status":
+            resident["status"],
+        "counter":
+            resident["counter"],
+        "mentor":
+            resident["mentor"],
+        "sheet_row":
+            resident["sheet_row"]
+    }
+
+
+# =========================================================
+# Resident Registry Writes
+# =========================================================
+
+def update_resident_state(
+    sheet_row,
+    status=None,
+    counter=None
+):
+    if status is not None:
+        status = (
+            str(status)
+            .strip()
+            .upper()
+        )
+
+        if status not in VALID_RESIDENT_STATUSES:
+            raise ValueError(
+                f"Invalid resident status: {status}"
+            )
+
+    sheets = get_sheets_service()
+
+    updates = []
+
+    if status is not None:
+        updates.append({
+            "range":
+                f"Approved_Residents!D{sheet_row}",
+            "values": [[status]]
+        })
+
+    if counter is not None:
+        updates.append({
+            "range":
+                f"Approved_Residents!E{sheet_row}",
+            "values": [[counter]]
+        })
+
+    if not updates:
+        return {
+            "updated": False,
+            "updated_cells": 0
+        }
+
+    body = {
+        "valueInputOption": "RAW",
+        "data": updates
+    }
+
+    result = (
+        sheets.spreadsheets()
+        .values()
+        .batchUpdate(
+            spreadsheetId=
+                RESIDENT_REGISTRY_SPREADSHEET_ID,
+            body=body
+        )
+        .execute()
+    )
+
+    return {
+        "updated": True,
+        "updated_cells":
+            result.get(
+                "totalUpdatedCells",
+                0
+            )
     }
 
 
@@ -208,10 +361,13 @@ def get_message_metadata(message_id):
     )
 
     headers = {
-        header["name"].lower(): header["value"]
-        for header in message
-        .get("payload", {})
-        .get("headers", [])
+        header["name"].lower():
+            header["value"]
+        for header in (
+            message
+            .get("payload", {})
+            .get("headers", [])
+        )
     }
 
     sender_name, sender_email = parseaddr(
@@ -219,14 +375,22 @@ def get_message_metadata(message_id):
     )
 
     return {
-        "message_id": message_id,
-        "thread_id": message.get("threadId"),
-        "label_ids": message.get("labelIds", []),
-        "sender_name": sender_name,
-        "sender_email": sender_email.strip().lower(),
-        "subject": headers.get("subject", ""),
-        "date": headers.get("date", ""),
-        "rfc_message_id": headers.get("message-id", "")
+        "message_id":
+            message_id,
+        "thread_id":
+            message.get("threadId"),
+        "label_ids":
+            message.get("labelIds", []),
+        "sender_name":
+            sender_name,
+        "sender_email":
+            sender_email.strip().lower(),
+        "subject":
+            headers.get("subject", ""),
+        "date":
+            headers.get("date", ""),
+        "rfc_message_id":
+            headers.get("message-id", "")
     }
 
 
@@ -238,10 +402,15 @@ def decode_body_data(data):
     if not data:
         return ""
 
-    padded_data = data + "=" * (-len(data) % 4)
+    padded_data = (
+        data
+        + "=" * (-len(data) % 4)
+    )
 
-    decoded_bytes = base64.urlsafe_b64decode(
-        padded_data
+    decoded_bytes = (
+        base64.urlsafe_b64decode(
+            padded_data
+        )
     )
 
     return decoded_bytes.decode(
@@ -251,7 +420,10 @@ def decode_body_data(data):
 
 
 def extract_plain_text_from_payload(payload):
-    mime_type = payload.get("mimeType", "")
+    mime_type = payload.get(
+        "mimeType",
+        ""
+    )
 
     body_data = (
         payload
@@ -259,30 +431,59 @@ def extract_plain_text_from_payload(payload):
         .get("data")
     )
 
-    if mime_type == "text/plain" and body_data:
-        return decode_body_data(body_data).strip()
+    if (
+        mime_type == "text/plain"
+        and body_data
+    ):
+        return (
+            decode_body_data(
+                body_data
+            )
+            .strip()
+        )
 
-    parts = payload.get("parts", [])
+    parts = payload.get(
+        "parts",
+        []
+    )
 
-    # Prefer text/plain
+    # Prefer text/plain.
     for part in parts:
-        if part.get("mimeType") == "text/plain":
-            text = extract_plain_text_from_payload(part)
+        if (
+            part.get("mimeType")
+            == "text/plain"
+        ):
+            text = (
+                extract_plain_text_from_payload(
+                    part
+                )
+            )
 
             if text:
                 return text
 
-    # Search nested multipart structures
+    # Search nested multipart structures.
     for part in parts:
         if part.get("parts"):
-            text = extract_plain_text_from_payload(part)
+            text = (
+                extract_plain_text_from_payload(
+                    part
+                )
+            )
 
             if text:
                 return text
 
-    # HTML fallback
-    if mime_type == "text/html" and body_data:
-        html_content = decode_body_data(body_data)
+    # HTML fallback.
+    if (
+        mime_type == "text/html"
+        and body_data
+    ):
+        html_content = (
+            decode_body_data(
+                body_data
+            )
+        )
 
         text = re.sub(
             r"<[^>]+>",
@@ -290,7 +491,9 @@ def extract_plain_text_from_payload(payload):
             html_content
         )
 
-        text = html.unescape(text)
+        text = html.unescape(
+            text
+        )
 
         text = re.sub(
             r"\s+",
@@ -301,8 +504,15 @@ def extract_plain_text_from_payload(payload):
         return text.strip()
 
     for part in parts:
-        if part.get("mimeType") == "text/html":
-            text = extract_plain_text_from_payload(part)
+        if (
+            part.get("mimeType")
+            == "text/html"
+        ):
+            text = (
+                extract_plain_text_from_payload(
+                    part
+                )
+            )
 
             if text:
                 return text
@@ -324,13 +534,25 @@ def get_full_authorized_message(message_id):
         .execute()
     )
 
-    payload = message.get("payload", {})
+    payload = message.get(
+        "payload",
+        {}
+    )
 
-    body = extract_plain_text_from_payload(payload)
+    body = (
+        extract_plain_text_from_payload(
+            payload
+        )
+    )
 
     return {
-        "body": body,
-        "snippet": message.get("snippet", "")
+        "body":
+            body,
+        "snippet":
+            message.get(
+                "snippet",
+                ""
+            )
     }
 
 
@@ -341,28 +563,52 @@ def get_full_authorized_message(message_id):
 def send_decline_reply(message):
     gmail = get_gmail_service()
 
-    original_subject = message["subject"]
+    original_subject = (
+        message["subject"]
+    )
 
-    if original_subject.lower().startswith("re:"):
-        reply_subject = original_subject
+    if (
+        original_subject
+        .lower()
+        .startswith("re:")
+    ):
+        reply_subject = (
+            original_subject
+        )
     else:
-        reply_subject = f"Re: {original_subject}"
+        reply_subject = (
+            f"Re: {original_subject}"
+        )
 
     body = (
-        "Thank you for contacting The Tech Residency Program.\n\n"
-        "This email address is not currently authorized to interact "
-        "with the Residency system. If you believe this is an error, "
-        "please contact the Residency Program coordinator using your "
-        "registered email address.\n\n"
+        "Thank you for contacting "
+        "The Tech Residency Program.\n\n"
+
+        "This email address is not currently "
+        "authorized to interact with the Residency "
+        "system. If you believe this is an error, "
+        "please contact the Residency Program "
+        "coordinator using your registered email "
+        "address.\n\n"
+
+        "Regards,\n"
+        "John Doe\n"
+        "Tech Lead\n"
         "The Tech Residency Program"
     )
 
     email_message = EmailMessage()
 
-    email_message["To"] = message["sender_email"]
-    email_message["Subject"] = reply_subject
+    email_message["To"] = (
+        message["sender_email"]
+    )
+
+    email_message["Subject"] = (
+        reply_subject
+    )
 
     if message["rfc_message_id"]:
+
         email_message["In-Reply-To"] = (
             message["rfc_message_id"]
         )
@@ -371,11 +617,16 @@ def send_decline_reply(message):
             message["rfc_message_id"]
         )
 
-    email_message.set_content(body)
+    email_message.set_content(
+        body
+    )
 
-    encoded_message = base64.urlsafe_b64encode(
-        email_message.as_bytes()
-    ).decode()
+    encoded_message = (
+        base64.urlsafe_b64encode(
+            email_message.as_bytes()
+        )
+        .decode()
+    )
 
     sent_message = (
         gmail.users()
@@ -383,8 +634,10 @@ def send_decline_reply(message):
         .send(
             userId="me",
             body={
-                "raw": encoded_message,
-                "threadId": message["thread_id"]
+                "raw":
+                    encoded_message,
+                "threadId":
+                    message["thread_id"]
             }
         )
         .execute()
@@ -397,7 +650,9 @@ def send_decline_reply(message):
 # Gmail History
 # =========================================================
 
-def get_new_message_ids(start_history_id):
+def get_new_message_ids(
+    start_history_id
+):
     gmail = get_gmail_service()
 
     message_ids = set()
@@ -411,44 +666,73 @@ def get_new_message_ids(start_history_id):
             .history()
             .list(
                 userId="me",
-                startHistoryId=str(start_history_id),
-                historyTypes=["messageAdded"],
+                startHistoryId=str(
+                    start_history_id
+                ),
+                historyTypes=[
+                    "messageAdded"
+                ],
                 labelId="INBOX",
                 pageToken=page_token
             )
         )
 
-        result = request.execute()
+        result = (
+            request.execute()
+        )
 
-        for history_record in result.get("history", []):
-
-            for added in history_record.get(
-                "messagesAdded",
+        for history_record in (
+            result.get(
+                "history",
                 []
-            ):
-                message = added.get("message", {})
+            )
+        ):
 
-                message_id = message.get("id")
-
-                label_ids = message.get(
-                    "labelIds",
+            for added in (
+                history_record.get(
+                    "messagesAdded",
                     []
+                )
+            ):
+                message = (
+                    added.get(
+                        "message",
+                        {}
+                    )
+                )
+
+                message_id = (
+                    message.get("id")
+                )
+
+                label_ids = (
+                    message.get(
+                        "labelIds",
+                        []
+                    )
                 )
 
                 if (
                     message_id
-                    and "INBOX" in label_ids
+                    and "INBOX"
+                    in label_ids
                 ):
-                    message_ids.add(message_id)
+                    message_ids.add(
+                        message_id
+                    )
 
-        page_token = result.get(
-            "nextPageToken"
+        page_token = (
+            result.get(
+                "nextPageToken"
+            )
         )
 
         if not page_token:
             break
 
-    return list(message_ids)
+    return list(
+        message_ids
+    )
 
 
 # =========================================================
@@ -458,42 +742,59 @@ def get_new_message_ids(start_history_id):
 def process_message(message_id):
     global latest_authorized_email
 
-    if message_id in processed_message_ids:
+    if (
+        message_id
+        in processed_message_ids
+    ):
         return {
-            "message_id": message_id,
-            "action": "duplicate_ignored"
+            "message_id":
+                message_id,
+            "action":
+                "duplicate_ignored"
         }
 
     # Metadata first.
-    # Body has NOT been retrieved at this point.
-    message = get_message_metadata(
-        message_id
+    # Body has NOT been retrieved yet.
+    message = (
+        get_message_metadata(
+            message_id
+        )
     )
 
-    # Safety check: process only INBOX messages.
-    if "INBOX" not in message["label_ids"]:
+    # Safety check:
+    # only process INBOX messages.
+    if (
+        "INBOX"
+        not in message["label_ids"]
+    ):
         processed_message_ids.add(
             message_id
         )
 
         return {
-            "message_id": message_id,
-            "action": "non_inbox_ignored"
+            "message_id":
+                message_id,
+            "action":
+                "non_inbox_ignored"
         }
 
-    authorization = authorize_sender(
-        message["sender_email"]
+    authorization = (
+        authorize_sender(
+            message["sender_email"]
+        )
     )
 
     # -----------------------------------------------------
-    # Unauthorized
+    # Unknown / unregistered email.
     # Do NOT retrieve body.
     # -----------------------------------------------------
 
     if not authorization["authorized"]:
 
-        sent_message = send_decline_reply(
-            message
+        sent_message = (
+            send_decline_reply(
+                message
+            )
         )
 
         processed_message_ids.add(
@@ -501,21 +802,25 @@ def process_message(message_id):
         )
 
         return {
-            "message_id": message_id,
+            "message_id":
+                message_id,
             "sender_email":
                 message["sender_email"],
-            "action": "decline_sent",
+            "action":
+                "decline_sent",
             "sent_message_id":
                 sent_message.get("id")
         }
 
     # -----------------------------------------------------
-    # Authorized
+    # Registered resident.
     # Only NOW retrieve full content.
     # -----------------------------------------------------
 
-    full_message = get_full_authorized_message(
-        message_id
+    full_message = (
+        get_full_authorized_message(
+            message_id
+        )
     )
 
     latest_authorized_email = {
@@ -529,6 +834,14 @@ def process_message(message_id):
             authorization["name"],
         "sender_email":
             authorization["email"],
+        "status":
+            authorization["status"],
+        "counter":
+            authorization["counter"],
+        "mentor":
+            authorization["mentor"],
+        "sheet_row":
+            authorization["sheet_row"],
         "subject":
             message["subject"],
         "date":
@@ -544,15 +857,20 @@ def process_message(message_id):
     )
 
     return {
-        "message_id": message_id,
+        "message_id":
+            message_id,
         "sender_email":
             message["sender_email"],
         "resident_id":
             authorization["resident_id"],
         "resident_name":
             authorization["name"],
+        "resident_status":
+            authorization["status"],
+        "resident_counter":
+            authorization["counter"],
         "action":
-            "authorized_email_extracted"
+            "registered_resident_email_extracted"
     }
 
 
@@ -585,25 +903,35 @@ def health():
 def google_auth():
     flow = create_flow()
 
-    code_verifier = secrets.token_urlsafe(64)
+    code_verifier = (
+        secrets.token_urlsafe(64)
+    )
 
     digest = hashlib.sha256(
         code_verifier.encode()
     ).digest()
 
     code_challenge = (
-        base64.urlsafe_b64encode(digest)
+        base64.urlsafe_b64encode(
+            digest
+        )
         .decode()
         .rstrip("=")
     )
 
     state_data = {
-        "cv": code_verifier
+        "cv":
+            code_verifier
     }
 
-    state = base64.urlsafe_b64encode(
-        json.dumps(state_data).encode()
-    ).decode()
+    state = (
+        base64.urlsafe_b64encode(
+            json.dumps(
+                state_data
+            ).encode()
+        )
+        .decode()
+    )
 
     authorization_url, _ = (
         flow.authorization_url(
@@ -611,8 +939,10 @@ def google_auth():
             include_granted_scopes="true",
             prompt="consent",
             state=state,
-            code_challenge=code_challenge,
-            code_challenge_method="S256",
+            code_challenge=
+                code_challenge,
+            code_challenge_method=
+                "S256",
         )
     )
 
@@ -622,9 +952,13 @@ def google_auth():
 
 
 @app.get("/oauth2/callback")
-def oauth_callback(request: Request):
-    state = request.query_params.get(
-        "state"
+def oauth_callback(
+    request: Request
+):
+    state = (
+        request.query_params.get(
+            "state"
+        )
     )
 
     if not state:
@@ -637,7 +971,8 @@ def oauth_callback(request: Request):
     try:
         padded_state = (
             state
-            + "=" * (-len(state) % 4)
+            + "="
+            * (-len(state) % 4)
         )
 
         state_data = json.loads(
@@ -669,7 +1004,9 @@ def oauth_callback(request: Request):
         )
     )
 
-    credentials = flow.credentials
+    credentials = (
+        flow.credentials
+    )
 
     return {
         "status":
@@ -733,6 +1070,92 @@ def test_residents():
 
 
 # =========================================================
+# Temporary State-Write Test
+#
+# This endpoint lets us prove that the new OAuth credential
+# can WRITE to Google Sheets.
+#
+# It does not change anything unless values are supplied.
+#
+# Example:
+# /test/update-resident-state/R001?status=JOINED
+#
+# Later this test endpoint can be removed.
+# =========================================================
+
+@app.get(
+    "/test/update-resident-state/{resident_id}"
+)
+def test_update_resident_state(
+    resident_id: str,
+    status: str = None,
+    counter: int = None
+):
+    residents = get_residents()
+
+    resident = next(
+        (
+            item
+            for item in residents
+            if (
+                item["resident_id"]
+                == resident_id
+            )
+        ),
+        None
+    )
+
+    if resident is None:
+        return {
+            "status":
+                "resident_not_found",
+            "resident_id":
+                resident_id
+        }
+
+    if (
+        status is None
+        and counter is None
+    ):
+        return {
+            "status":
+                "no_change_requested",
+            "resident":
+                resident,
+            "message":
+                "Provide status and/or counter "
+                "as query parameters."
+        }
+
+    try:
+        result = (
+            update_resident_state(
+                sheet_row=
+                    resident["sheet_row"],
+                status=status,
+                counter=counter
+            )
+        )
+
+    except ValueError as error:
+        return {
+            "status":
+                "invalid_request",
+            "message":
+                str(error)
+        }
+
+    return {
+        "status":
+            "resident_state_updated",
+        "resident_id":
+            resident_id,
+        "result":
+            result
+    }
+
+
+# =========================================================
 # Gmail Pub/Sub Webhook
 # =========================================================
 
@@ -744,16 +1167,22 @@ async def gmail_pubsub_webhook(
     global last_history_id
 
     try:
-        payload = await request.json()
-
-        pubsub_message = payload.get(
-            "message",
-            {}
+        payload = (
+            await request.json()
         )
 
-        encoded_data = pubsub_message.get(
-            "data",
-            ""
+        pubsub_message = (
+            payload.get(
+                "message",
+                {}
+            )
+        )
+
+        encoded_data = (
+            pubsub_message.get(
+                "data",
+                ""
+            )
         )
 
         decoded_data = {}
@@ -771,9 +1200,11 @@ async def gmail_pubsub_webhook(
                 )
             )
 
-            decoded_data = json.loads(
-                decoded_bytes.decode(
-                    "utf-8"
+            decoded_data = (
+                json.loads(
+                    decoded_bytes.decode(
+                        "utf-8"
+                    )
                 )
             )
 
@@ -800,10 +1231,12 @@ async def gmail_pubsub_webhook(
                 incoming_history_id,
             "previous_history_id":
                 last_history_id,
-            "processing_results": []
+            "processing_results":
+                []
         }
 
         if not incoming_history_id:
+
             latest_gmail_notification[
                 "status"
             ] = "missing_history_id"
@@ -813,9 +1246,8 @@ async def gmail_pubsub_webhook(
                     "notification_received"
             }
 
-        # If no baseline exists, establish one.
-        # This happens after a server restart
-        # unless the watch endpoint was called.
+        # If no baseline exists,
+        # establish one.
         if last_history_id is None:
 
             last_history_id = (
@@ -824,7 +1256,9 @@ async def gmail_pubsub_webhook(
 
             latest_gmail_notification[
                 "status"
-            ] = "history_baseline_initialized"
+            ] = (
+                "history_baseline_initialized"
+            )
 
             return {
                 "status":
@@ -832,24 +1266,29 @@ async def gmail_pubsub_webhook(
             }
 
         # Retrieve exact messages added
-        # since the previous Gmail history state.
-        message_ids = get_new_message_ids(
-            last_history_id
+        # since previous Gmail history state.
+        message_ids = (
+            get_new_message_ids(
+                last_history_id
+            )
         )
 
         processing_results = []
 
         for message_id in message_ids:
-            result = process_message(
-                message_id
+
+            result = (
+                process_message(
+                    message_id
+                )
             )
 
             processing_results.append(
                 result
             )
 
-        # Advance history state only after
-        # processing this notification.
+        # Advance history state only
+        # after processing.
         last_history_id = (
             incoming_history_id
         )
@@ -907,7 +1346,10 @@ async def gmail_pubsub_webhook(
 @app.get("/test/latest-notification")
 def get_latest_notification():
 
-    if latest_gmail_notification is None:
+    if (
+        latest_gmail_notification
+        is None
+    ):
         return {
             "status":
                 "no_notification_received"
@@ -924,7 +1366,10 @@ def get_latest_notification():
 @app.get("/test/latest-authorized-email")
 def get_latest_authorized_email():
 
-    if latest_authorized_email is None:
+    if (
+        latest_authorized_email
+        is None
+    ):
         return {
             "status":
                 "no_authorized_email_extracted"
@@ -944,7 +1389,9 @@ def get_runtime_state():
         "last_history_id":
             last_history_id,
         "processed_message_count":
-            len(processed_message_ids)
+            len(
+                processed_message_ids
+            )
     }
 
 
@@ -979,19 +1426,25 @@ def start_gmail_watch():
         .execute()
     )
 
-    # The history ID returned by watch becomes
-    # our baseline for subsequent notifications.
+    # History ID returned by watch
+    # becomes our baseline.
     last_history_id = (
-        result.get("historyId")
+        result.get(
+            "historyId"
+        )
     )
 
     return {
         "status":
             "gmail_watch_started",
         "history_id":
-            result.get("historyId"),
+            result.get(
+                "historyId"
+            ),
         "expiration":
-            result.get("expiration"),
+            result.get(
+                "expiration"
+            ),
         "history_baseline_saved":
             True
     }
