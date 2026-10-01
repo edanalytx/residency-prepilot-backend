@@ -3,6 +3,7 @@ import secrets
 import hashlib
 import base64
 import json
+from email.utils import parseaddr
 
 from fastapi import FastAPI, Request
 from fastapi.responses import RedirectResponse
@@ -40,7 +41,7 @@ SCOPES = [
 
 
 # ---------------------------------------------------------
-# OAuth Flow
+# OAuth
 # ---------------------------------------------------------
 
 def create_flow():
@@ -62,10 +63,6 @@ def create_flow():
     )
 
 
-# ---------------------------------------------------------
-# Stored Google Credentials
-# ---------------------------------------------------------
-
 def get_google_credentials():
     return Credentials(
         token=None,
@@ -75,6 +72,74 @@ def get_google_credentials():
         client_secret=GOOGLE_CLIENT_SECRET,
         scopes=SCOPES,
     )
+
+
+# ---------------------------------------------------------
+# Resident Registry
+# ---------------------------------------------------------
+
+def get_residents():
+    credentials = get_google_credentials()
+
+    sheets = build(
+        "sheets",
+        "v4",
+        credentials=credentials
+    )
+
+    result = (
+        sheets.spreadsheets()
+        .values()
+        .get(
+            spreadsheetId=RESIDENT_REGISTRY_SPREADSHEET_ID,
+            range="Approved_Residents!A:D"
+        )
+        .execute()
+    )
+
+    rows = result.get("values", [])
+
+    residents = []
+
+    for row in rows[1:]:
+        if not row:
+            continue
+
+        residents.append({
+            "resident_id": row[0].strip() if len(row) > 0 else "",
+            "name": row[1].strip() if len(row) > 1 else "",
+            "email": row[2].strip().lower() if len(row) > 2 else "",
+            "active": row[3].strip().upper() if len(row) > 3 else ""
+        })
+
+    return residents
+
+
+def authorize_sender(sender_email):
+    normalized_email = sender_email.strip().lower()
+
+    residents = get_residents()
+
+    for resident in residents:
+        if resident["email"] == normalized_email:
+
+            if resident["active"] == "TRUE":
+                return {
+                    "authorized": True,
+                    "resident_id": resident["resident_id"],
+                    "name": resident["name"],
+                    "email": resident["email"]
+                }
+
+            return {
+                "authorized": False,
+                "reason": "inactive"
+            }
+
+    return {
+        "authorized": False,
+        "reason": "not_registered"
+    }
 
 
 # ---------------------------------------------------------
@@ -136,10 +201,6 @@ def google_auth():
     return RedirectResponse(authorization_url)
 
 
-# ---------------------------------------------------------
-# OAuth Callback
-# ---------------------------------------------------------
-
 @app.get("/oauth2/callback")
 def oauth_callback(request: Request):
     state = request.query_params.get("state")
@@ -186,7 +247,7 @@ def oauth_callback(request: Request):
 
 
 # ---------------------------------------------------------
-# Gmail Test
+# Gmail Connection Test
 # ---------------------------------------------------------
 
 @app.get("/test/gmail")
@@ -219,48 +280,86 @@ def test_gmail():
 
 @app.get("/test/residents")
 def test_residents():
-    credentials = get_google_credentials()
-
-    sheets = build(
-        "sheets",
-        "v4",
-        credentials=credentials
-    )
-
-    result = (
-        sheets.spreadsheets()
-        .values()
-        .get(
-            spreadsheetId=RESIDENT_REGISTRY_SPREADSHEET_ID,
-            range="Approved_Residents!A:D"
-        )
-        .execute()
-    )
-
-    rows = result.get("values", [])
-
-    if not rows:
-        return {
-            "status": "registry_connected",
-            "resident_count": 0,
-            "residents": []
-        }
-
-    residents = []
-
-    for row in rows[1:]:
-        if not row:
-            continue
-
-        residents.append({
-            "resident_id": row[0] if len(row) > 0 else "",
-            "name": row[1] if len(row) > 1 else "",
-            "email": row[2] if len(row) > 2 else "",
-            "active": row[3] if len(row) > 3 else ""
-        })
+    residents = get_residents()
 
     return {
         "status": "registry_connected",
         "resident_count": len(residents),
         "residents": residents
+    }
+
+
+# ---------------------------------------------------------
+# Latest Inbox Message + Authorization Test
+# ---------------------------------------------------------
+
+@app.get("/test/latest-email")
+def test_latest_email():
+    credentials = get_google_credentials()
+
+    gmail = build(
+        "gmail",
+        "v1",
+        credentials=credentials
+    )
+
+    result = (
+        gmail.users()
+        .messages()
+        .list(
+            userId="me",
+            labelIds=["INBOX"],
+            maxResults=1
+        )
+        .execute()
+    )
+
+    messages = result.get("messages", [])
+
+    if not messages:
+        return {
+            "status": "no_inbox_messages"
+        }
+
+    message_id = messages[0]["id"]
+
+    message = (
+        gmail.users()
+        .messages()
+        .get(
+            userId="me",
+            id=message_id,
+            format="metadata",
+            metadataHeaders=[
+                "From",
+                "Subject",
+                "Date"
+            ]
+        )
+        .execute()
+    )
+
+    headers = {
+        header["name"].lower(): header["value"]
+        for header in message
+        .get("payload", {})
+        .get("headers", [])
+    }
+
+    raw_from = headers.get("from", "")
+
+    sender_name, sender_email = parseaddr(raw_from)
+
+    sender_email = sender_email.strip().lower()
+
+    authorization = authorize_sender(sender_email)
+
+    return {
+        "status": "email_checked",
+        "message_id": message_id,
+        "sender_name": sender_name,
+        "sender_email": sender_email,
+        "subject": headers.get("subject", ""),
+        "date": headers.get("date", ""),
+        "authorization": authorization
     }
