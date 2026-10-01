@@ -1,4 +1,8 @@
 import os
+import secrets
+import hashlib
+import base64
+import json
 
 from fastapi import FastAPI, Request
 from fastapi.responses import RedirectResponse
@@ -31,6 +35,7 @@ def create_flow():
         client_config,
         scopes=SCOPES,
         redirect_uri=GOOGLE_REDIRECT_URI,
+        autogenerate_code_verifier=False,
     )
 
 
@@ -51,10 +56,32 @@ def health():
 def google_auth():
     flow = create_flow()
 
-    authorization_url, state = flow.authorization_url(
+    # Generate PKCE code verifier
+    code_verifier = secrets.token_urlsafe(64)
+
+    digest = hashlib.sha256(code_verifier.encode()).digest()
+    code_challenge = (
+        base64.urlsafe_b64encode(digest)
+        .decode()
+        .rstrip("=")
+    )
+
+    # Carry the verifier through the OAuth round trip
+    state_data = {
+        "cv": code_verifier
+    }
+
+    state = base64.urlsafe_b64encode(
+        json.dumps(state_data).encode()
+    ).decode()
+
+    authorization_url, _ = flow.authorization_url(
         access_type="offline",
         include_granted_scopes="true",
         prompt="consent",
+        state=state,
+        code_challenge=code_challenge,
+        code_challenge_method="S256",
     )
 
     return RedirectResponse(authorization_url)
@@ -62,7 +89,31 @@ def google_auth():
 
 @app.get("/oauth2/callback")
 def oauth_callback(request: Request):
+    state = request.query_params.get("state")
+
+    if not state:
+        return {
+            "status": "error",
+            "message": "OAuth state is missing."
+        }
+
+    try:
+        padded_state = state + "=" * (-len(state) % 4)
+
+        state_data = json.loads(
+            base64.urlsafe_b64decode(padded_state).decode()
+        )
+
+        code_verifier = state_data["cv"]
+
+    except Exception:
+        return {
+            "status": "error",
+            "message": "Invalid OAuth state."
+        }
+
     flow = create_flow()
+    flow.code_verifier = code_verifier
 
     flow.fetch_token(
         authorization_response=str(request.url)
