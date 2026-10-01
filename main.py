@@ -4,23 +4,39 @@ import hashlib
 import base64
 import json
 
-
-
 from fastapi import FastAPI, Request
 from fastapi.responses import RedirectResponse
+
 from google_auth_oauthlib.flow import Flow
+from google.oauth2.credentials import Credentials
+from googleapiclient.discovery import build
 
 
 app = FastAPI(title="Residency Pre-Pilot Backend")
 
+
+# ---------------------------------------------------------
+# Environment Variables
+# ---------------------------------------------------------
+
 GOOGLE_CLIENT_ID = os.environ["GOOGLE_CLIENT_ID"]
 GOOGLE_CLIENT_SECRET = os.environ["GOOGLE_CLIENT_SECRET"]
 GOOGLE_REDIRECT_URI = os.environ["GOOGLE_REDIRECT_URI"]
+GOOGLE_REFRESH_TOKEN = os.environ["GOOGLE_REFRESH_TOKEN"]
+
+
+# ---------------------------------------------------------
+# Google API Scopes
+# ---------------------------------------------------------
 
 SCOPES = [
     "https://www.googleapis.com/auth/gmail.modify"
 ]
 
+
+# ---------------------------------------------------------
+# OAuth Flow
+# ---------------------------------------------------------
 
 def create_flow():
     client_config = {
@@ -41,6 +57,10 @@ def create_flow():
     )
 
 
+# ---------------------------------------------------------
+# Basic Service Endpoints
+# ---------------------------------------------------------
+
 @app.get("/")
 def home():
     return {
@@ -51,8 +71,14 @@ def home():
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {
+        "status": "ok"
+    }
 
+
+# ---------------------------------------------------------
+# Google Authorization
+# ---------------------------------------------------------
 
 @app.get("/auth/google")
 def google_auth():
@@ -61,14 +87,17 @@ def google_auth():
     # Generate PKCE code verifier
     code_verifier = secrets.token_urlsafe(64)
 
-    digest = hashlib.sha256(code_verifier.encode()).digest()
+    digest = hashlib.sha256(
+        code_verifier.encode()
+    ).digest()
+
     code_challenge = (
         base64.urlsafe_b64encode(digest)
         .decode()
         .rstrip("=")
     )
 
-    # Carry the verifier through the OAuth round trip
+    # Carry verifier through OAuth round trip
     state_data = {
         "cv": code_verifier
     }
@@ -89,6 +118,10 @@ def google_auth():
     return RedirectResponse(authorization_url)
 
 
+# ---------------------------------------------------------
+# OAuth Callback
+# ---------------------------------------------------------
+
 @app.get("/oauth2/callback")
 def oauth_callback(request: Request):
     state = request.query_params.get("state")
@@ -103,7 +136,9 @@ def oauth_callback(request: Request):
         padded_state = state + "=" * (-len(state) % 4)
 
         state_data = json.loads(
-            base64.urlsafe_b64decode(padded_state).decode()
+            base64.urlsafe_b64decode(
+                padded_state
+            ).decode()
         )
 
         code_verifier = state_data["cv"]
@@ -115,6 +150,7 @@ def oauth_callback(request: Request):
         }
 
     flow = create_flow()
+
     flow.code_verifier = code_verifier
 
     flow.fetch_token(
@@ -124,7 +160,52 @@ def oauth_callback(request: Request):
     credentials = flow.credentials
 
     return {
-    "status": "authorization_successful",
-    "refresh_token_received": bool(credentials.refresh_token),
-    "message": "Google authorization completed successfully."
-}
+        "status": "authorization_successful",
+        "refresh_token_received": bool(
+            credentials.refresh_token
+        ),
+        "message": "Google authorization completed successfully."
+    }
+
+
+# ---------------------------------------------------------
+# Gmail Credentials
+# ---------------------------------------------------------
+
+def get_gmail_credentials():
+    return Credentials(
+        token=None,
+        refresh_token=GOOGLE_REFRESH_TOKEN,
+        token_uri="https://oauth2.googleapis.com/token",
+        client_id=GOOGLE_CLIENT_ID,
+        client_secret=GOOGLE_CLIENT_SECRET,
+        scopes=SCOPES,
+    )
+
+
+# ---------------------------------------------------------
+# Gmail Connection Test
+# ---------------------------------------------------------
+
+@app.get("/test/gmail")
+def test_gmail():
+    credentials = get_gmail_credentials()
+
+    gmail = build(
+        "gmail",
+        "v1",
+        credentials=credentials
+    )
+
+    profile = (
+        gmail.users()
+        .getProfile(userId="me")
+        .execute()
+    )
+
+    return {
+        "status": "gmail_connected",
+        "email": profile.get("emailAddress"),
+        "messages_total": profile.get("messagesTotal"),
+        "threads_total": profile.get("threadsTotal")
+    }
