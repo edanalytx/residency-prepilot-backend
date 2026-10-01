@@ -268,6 +268,119 @@ def authorize_sender(sender_email):
         "sheet_row": resident["sheet_row"]
     }
 
+# =========================================================
+# Backlog Catalog
+#
+# Backlogs Sheet:
+# A = Backlog_ID
+# B = Title
+# C = Project
+# D = Description
+# E = Expected_Output
+# F = Completion_Conditions
+# G = Estimated_Effort
+# H = Active
+# =========================================================
+
+def get_backlogs():
+    sheets = get_sheets_service()
+
+    result = (
+        sheets.spreadsheets()
+        .values()
+        .get(
+            spreadsheetId=RESIDENT_REGISTRY_SPREADSHEET_ID,
+            range="Backlogs!A:H"
+        )
+        .execute()
+    )
+
+    rows = result.get("values", [])
+
+    backlogs = []
+
+    for sheet_row, row in enumerate(
+        rows[1:],
+        start=2
+    ):
+        if not row:
+            continue
+
+        backlog = {
+            "backlog_id": (
+                row[0].strip()
+                if len(row) > 0
+                else ""
+            ),
+            "title": (
+                row[1].strip()
+                if len(row) > 1
+                else ""
+            ),
+            "project": (
+                row[2].strip()
+                if len(row) > 2
+                else ""
+            ),
+            "description": (
+                row[3].strip()
+                if len(row) > 3
+                else ""
+            ),
+            "expected_output": (
+                row[4].strip()
+                if len(row) > 4
+                else ""
+            ),
+            "completion_conditions": (
+                row[5].strip()
+                if len(row) > 5
+                else ""
+            ),
+            "estimated_effort": (
+                row[6].strip()
+                if len(row) > 6
+                else ""
+            ),
+            "active": (
+                row[7].strip().upper()
+                if len(row) > 7
+                else ""
+            ),
+            "sheet_row": sheet_row
+        }
+
+        backlogs.append(backlog)
+
+    return backlogs
+
+
+def get_active_backlogs():
+    return [
+        backlog
+        for backlog in get_backlogs()
+        if backlog["active"] == "TRUE"
+    ]
+
+
+def select_pilot_backlog():
+    """
+    Temporary allocation rule.
+
+    For the pre-pilot template workflow,
+    simply return the first active backlog.
+
+    Later this function will be replaced by
+    the Job Allocation AI / Work Orchestrator.
+    """
+
+    active_backlogs = get_active_backlogs()
+
+    if not active_backlogs:
+        return None
+
+    return active_backlogs[0]
+
 
 # =========================================================
 # Resident Registry Writes
@@ -536,6 +649,221 @@ def process_all_joined_residents():
         "results":
             results
     }
+
+# =========================================================
+# Backlog Assignment Template
+# =========================================================
+
+def build_backlog_assignment_message(
+    resident,
+    backlog
+):
+    first_name = (
+        resident["name"]
+        .strip()
+        .split()[0]
+        if resident["name"].strip()
+        else "Resident"
+    )
+
+    subject = (
+        f"Your First Backlog — "
+        f"{backlog['backlog_id']}: "
+        f"{backlog['title']}"
+    )
+
+    body = f"""Hi {first_name},
+
+You're ready to begin your first assignment.
+
+I've assigned you the following Backlog:
+
+Backlog ID: {backlog['backlog_id']}
+Project: {backlog['project']}
+Title: {backlog['title']}
+
+WHAT YOU'LL BE WORKING ON
+
+{backlog['description']}
+
+EXPECTED OUTPUT
+
+{backlog['expected_output']}
+
+COMPLETION CONDITIONS
+
+{backlog['completion_conditions']}
+
+ESTIMATED EFFORT
+
+{backlog['estimated_effort']}
+
+Please work on this assignment in your GitHub repository and commit your work regularly as you progress.
+
+When the Backlog is complete, reply to this email with the GitHub repository link containing your submission.
+
+You don't need to wait until completion to contact me. If you're blocked, unsure about a requirement, or need guidance, reply to this thread and let me know what you're working on and where you're stuck.
+
+I'll also check in periodically while the Backlog is active.
+
+Good luck with your first assignment.
+
+Regards,
+John Doe
+Tech Lead
+The Tech Residency Program"""
+
+    return {
+        "subject": subject,
+        "body": body
+    }
+
+
+# =========================================================
+# READY -> Backlog Assignment -> ACTIVE / Counter 3
+# =========================================================
+
+def process_ready_resident(
+    resident,
+    backlog
+):
+    if resident["status"] != "READY":
+        return {
+            "resident_id":
+                resident["resident_id"],
+            "action":
+                "skipped",
+            "reason":
+                "resident_not_ready"
+        }
+
+    if not resident["email"]:
+        return {
+            "resident_id":
+                resident["resident_id"],
+            "action":
+                "failed",
+            "reason":
+                "resident_email_missing"
+        }
+
+    if backlog is None:
+        return {
+            "resident_id":
+                resident["resident_id"],
+            "action":
+                "failed",
+            "reason":
+                "no_active_backlog_available"
+        }
+
+    assignment = (
+        build_backlog_assignment_message(
+            resident=resident,
+            backlog=backlog
+        )
+    )
+
+    # Send the assignment first.
+    sent_message = send_email(
+        recipient=resident["email"],
+        subject=assignment["subject"],
+        body=assignment["body"]
+    )
+
+    sent_message_id = (
+        sent_message.get("id")
+    )
+
+    if not sent_message_id:
+        return {
+            "resident_id":
+                resident["resident_id"],
+            "action":
+                "failed",
+            "reason":
+                "assignment_email_not_confirmed"
+        }
+
+    # Only update the resident after
+    # Gmail confirms successful delivery.
+    update_result = update_resident_state(
+        sheet_row=resident["sheet_row"],
+        status="ACTIVE",
+        counter=3
+    )
+
+    return {
+        "resident_id":
+            resident["resident_id"],
+        "resident_email":
+            resident["email"],
+        "backlog_id":
+            backlog["backlog_id"],
+        "backlog_title":
+            backlog["title"],
+        "action":
+            "backlog_assigned",
+        "sent_message_id":
+            sent_message_id,
+        "old_status":
+            "READY",
+        "new_status":
+            "ACTIVE",
+        "new_counter":
+            3,
+        "sheet_update":
+            update_result
+    }
+
+
+def process_all_ready_residents():
+    residents = get_residents()
+
+    ready_residents = [
+        resident
+        for resident in residents
+        if resident["status"] == "READY"
+    ]
+
+    # Temporary allocation mechanism.
+    backlog = select_pilot_backlog()
+
+    results = []
+
+    for resident in ready_residents:
+        try:
+            result = process_ready_resident(
+                resident=resident,
+                backlog=backlog
+            )
+
+        except Exception as error:
+            result = {
+                "resident_id":
+                    resident["resident_id"],
+                "action":
+                    "failed",
+                "error":
+                    str(error)
+            }
+
+        results.append(result)
+
+    return {
+        "ready_resident_count":
+            len(ready_residents),
+        "selected_backlog":
+            (
+                backlog["backlog_id"]
+                if backlog
+                else None
+            ),
+        "results":
+            results
+    }
+
+
 
 
 # =========================================================
@@ -1724,6 +2052,42 @@ async def gmail_pubsub_webhook(
         return {
             "status":
                 "notification_error"
+        }
+
+# =========================================================
+# TEST: Process READY Residents
+#
+# Temporary manual trigger.
+# Later this will be called by the orchestrator.
+# =========================================================
+
+@app.get("/test/process-ready")
+def test_process_ready():
+    try:
+        result = (
+            process_all_ready_residents()
+        )
+
+        return {
+            "status":
+                "ready_processing_complete",
+            **result
+        }
+
+    except HttpError as error:
+        return {
+            "status":
+                "google_api_error",
+            "error":
+                str(error)
+        }
+
+    except Exception as error:
+        return {
+            "status":
+                "processing_error",
+            "error":
+                str(error)
         }
 
 
