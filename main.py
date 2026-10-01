@@ -3,6 +3,8 @@ import secrets
 import hashlib
 import base64
 import json
+import html
+import re
 
 from email.utils import parseaddr
 from email.message import EmailMessage
@@ -13,11 +15,23 @@ from fastapi.responses import RedirectResponse
 from google_auth_oauthlib.flow import Flow
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
 
 app = FastAPI(title="Residency Pre-Pilot Backend")
 
+
+# =========================================================
+# Temporary Runtime State
+# Later this will move to persistent storage.
+# =========================================================
+
 latest_gmail_notification = None
+latest_authorized_email = None
+
+last_history_id = None
+
+processed_message_ids = set()
 
 
 # =========================================================
@@ -161,37 +175,19 @@ def authorize_sender(sender_email):
                 "email": resident["email"]
             }
 
-    # FALSE, inactive, missing, or not listed:
-    # all treated identically.
+    # Not listed, FALSE, inactive, blank, etc.
+    # All are treated identically.
     return {
         "authorized": False
     }
 
 
 # =========================================================
-# Gmail Helpers
+# Gmail Metadata Helpers
 # =========================================================
 
-def get_latest_inbox_message():
+def get_message_metadata(message_id):
     gmail = get_gmail_service()
-
-    result = (
-        gmail.users()
-        .messages()
-        .list(
-            userId="me",
-            labelIds=["INBOX"],
-            maxResults=1
-        )
-        .execute()
-    )
-
-    messages = result.get("messages", [])
-
-    if not messages:
-        return None
-
-    message_id = messages[0]["id"]
 
     message = (
         gmail.users()
@@ -225,6 +221,7 @@ def get_latest_inbox_message():
     return {
         "message_id": message_id,
         "thread_id": message.get("threadId"),
+        "label_ids": message.get("labelIds", []),
         "sender_name": sender_name,
         "sender_email": sender_email.strip().lower(),
         "subject": headers.get("subject", ""),
@@ -232,6 +229,114 @@ def get_latest_inbox_message():
         "rfc_message_id": headers.get("message-id", "")
     }
 
+
+# =========================================================
+# Email Body Extraction
+# =========================================================
+
+def decode_body_data(data):
+    if not data:
+        return ""
+
+    padded_data = data + "=" * (-len(data) % 4)
+
+    decoded_bytes = base64.urlsafe_b64decode(
+        padded_data
+    )
+
+    return decoded_bytes.decode(
+        "utf-8",
+        errors="replace"
+    )
+
+
+def extract_plain_text_from_payload(payload):
+    mime_type = payload.get("mimeType", "")
+
+    body_data = (
+        payload
+        .get("body", {})
+        .get("data")
+    )
+
+    if mime_type == "text/plain" and body_data:
+        return decode_body_data(body_data).strip()
+
+    parts = payload.get("parts", [])
+
+    # Prefer text/plain
+    for part in parts:
+        if part.get("mimeType") == "text/plain":
+            text = extract_plain_text_from_payload(part)
+
+            if text:
+                return text
+
+    # Search nested multipart structures
+    for part in parts:
+        if part.get("parts"):
+            text = extract_plain_text_from_payload(part)
+
+            if text:
+                return text
+
+    # HTML fallback
+    if mime_type == "text/html" and body_data:
+        html_content = decode_body_data(body_data)
+
+        text = re.sub(
+            r"<[^>]+>",
+            " ",
+            html_content
+        )
+
+        text = html.unescape(text)
+
+        text = re.sub(
+            r"\s+",
+            " ",
+            text
+        )
+
+        return text.strip()
+
+    for part in parts:
+        if part.get("mimeType") == "text/html":
+            text = extract_plain_text_from_payload(part)
+
+            if text:
+                return text
+
+    return ""
+
+
+def get_full_authorized_message(message_id):
+    gmail = get_gmail_service()
+
+    message = (
+        gmail.users()
+        .messages()
+        .get(
+            userId="me",
+            id=message_id,
+            format="full"
+        )
+        .execute()
+    )
+
+    payload = message.get("payload", {})
+
+    body = extract_plain_text_from_payload(payload)
+
+    return {
+        "body": body,
+        "snippet": message.get("snippet", "")
+    }
+
+
+# =========================================================
+# Fixed Decline Reply
+# =========================================================
 
 def send_decline_reply(message):
     gmail = get_gmail_service()
@@ -258,8 +363,13 @@ def send_decline_reply(message):
     email_message["Subject"] = reply_subject
 
     if message["rfc_message_id"]:
-        email_message["In-Reply-To"] = message["rfc_message_id"]
-        email_message["References"] = message["rfc_message_id"]
+        email_message["In-Reply-To"] = (
+            message["rfc_message_id"]
+        )
+
+        email_message["References"] = (
+            message["rfc_message_id"]
+        )
 
     email_message.set_content(body)
 
@@ -284,14 +394,179 @@ def send_decline_reply(message):
 
 
 # =========================================================
+# Gmail History
+# =========================================================
+
+def get_new_message_ids(start_history_id):
+    gmail = get_gmail_service()
+
+    message_ids = set()
+
+    page_token = None
+
+    while True:
+
+        request = (
+            gmail.users()
+            .history()
+            .list(
+                userId="me",
+                startHistoryId=str(start_history_id),
+                historyTypes=["messageAdded"],
+                labelId="INBOX",
+                pageToken=page_token
+            )
+        )
+
+        result = request.execute()
+
+        for history_record in result.get("history", []):
+
+            for added in history_record.get(
+                "messagesAdded",
+                []
+            ):
+                message = added.get("message", {})
+
+                message_id = message.get("id")
+
+                label_ids = message.get(
+                    "labelIds",
+                    []
+                )
+
+                if (
+                    message_id
+                    and "INBOX" in label_ids
+                ):
+                    message_ids.add(message_id)
+
+        page_token = result.get(
+            "nextPageToken"
+        )
+
+        if not page_token:
+            break
+
+    return list(message_ids)
+
+
+# =========================================================
+# Process Exact Gmail Message
+# =========================================================
+
+def process_message(message_id):
+    global latest_authorized_email
+
+    if message_id in processed_message_ids:
+        return {
+            "message_id": message_id,
+            "action": "duplicate_ignored"
+        }
+
+    # Metadata first.
+    # Body has NOT been retrieved at this point.
+    message = get_message_metadata(
+        message_id
+    )
+
+    # Safety check: process only INBOX messages.
+    if "INBOX" not in message["label_ids"]:
+        processed_message_ids.add(
+            message_id
+        )
+
+        return {
+            "message_id": message_id,
+            "action": "non_inbox_ignored"
+        }
+
+    authorization = authorize_sender(
+        message["sender_email"]
+    )
+
+    # -----------------------------------------------------
+    # Unauthorized
+    # Do NOT retrieve body.
+    # -----------------------------------------------------
+
+    if not authorization["authorized"]:
+
+        sent_message = send_decline_reply(
+            message
+        )
+
+        processed_message_ids.add(
+            message_id
+        )
+
+        return {
+            "message_id": message_id,
+            "sender_email":
+                message["sender_email"],
+            "action": "decline_sent",
+            "sent_message_id":
+                sent_message.get("id")
+        }
+
+    # -----------------------------------------------------
+    # Authorized
+    # Only NOW retrieve full content.
+    # -----------------------------------------------------
+
+    full_message = get_full_authorized_message(
+        message_id
+    )
+
+    latest_authorized_email = {
+        "message_id":
+            message["message_id"],
+        "thread_id":
+            message["thread_id"],
+        "resident_id":
+            authorization["resident_id"],
+        "resident_name":
+            authorization["name"],
+        "sender_email":
+            authorization["email"],
+        "subject":
+            message["subject"],
+        "date":
+            message["date"],
+        "body":
+            full_message["body"],
+        "snippet":
+            full_message["snippet"]
+    }
+
+    processed_message_ids.add(
+        message_id
+    )
+
+    return {
+        "message_id": message_id,
+        "sender_email":
+            message["sender_email"],
+        "resident_id":
+            authorization["resident_id"],
+        "resident_name":
+            authorization["name"],
+        "action":
+            "authorized_email_extracted"
+    }
+
+
+# =========================================================
 # Basic Endpoints
 # =========================================================
 
 @app.get("/")
 def home():
     return {
-        "service": "Residency Pre-Pilot Backend",
-        "status": "running"
+        "service":
+            "Residency Pre-Pilot Backend",
+        "status":
+            "running"
     }
 
 
@@ -330,30 +605,40 @@ def google_auth():
         json.dumps(state_data).encode()
     ).decode()
 
-    authorization_url, _ = flow.authorization_url(
-        access_type="offline",
-        include_granted_scopes="true",
-        prompt="consent",
-        state=state,
-        code_challenge=code_challenge,
-        code_challenge_method="S256",
+    authorization_url, _ = (
+        flow.authorization_url(
+            access_type="offline",
+            include_granted_scopes="true",
+            prompt="consent",
+            state=state,
+            code_challenge=code_challenge,
+            code_challenge_method="S256",
+        )
     )
 
-    return RedirectResponse(authorization_url)
+    return RedirectResponse(
+        authorization_url
+    )
 
 
 @app.get("/oauth2/callback")
 def oauth_callback(request: Request):
-    state = request.query_params.get("state")
+    state = request.query_params.get(
+        "state"
+    )
 
     if not state:
         return {
             "status": "error",
-            "message": "OAuth state is missing."
+            "message":
+                "OAuth state is missing."
         }
 
     try:
-        padded_state = state + "=" * (-len(state) % 4)
+        padded_state = (
+            state
+            + "=" * (-len(state) % 4)
+        )
 
         state_data = json.loads(
             base64.urlsafe_b64decode(
@@ -361,30 +646,41 @@ def oauth_callback(request: Request):
             ).decode()
         )
 
-        code_verifier = state_data["cv"]
+        code_verifier = (
+            state_data["cv"]
+        )
 
     except Exception:
         return {
             "status": "error",
-            "message": "Invalid OAuth state."
+            "message":
+                "Invalid OAuth state."
         }
 
     flow = create_flow()
-    flow.code_verifier = code_verifier
+
+    flow.code_verifier = (
+        code_verifier
+    )
 
     flow.fetch_token(
-        authorization_response=str(request.url)
+        authorization_response=str(
+            request.url
+        )
     )
 
     credentials = flow.credentials
 
     return {
-        "status": "authorization_successful",
-        "refresh_token_received": bool(
-            credentials.refresh_token
-        ),
+        "status":
+            "authorization_successful",
+        "refresh_token_received":
+            bool(
+                credentials.refresh_token
+            ),
         "message":
-            "Google authorization completed successfully."
+            "Google authorization "
+            "completed successfully."
     }
 
 
@@ -398,15 +694,27 @@ def test_gmail():
 
     profile = (
         gmail.users()
-        .getProfile(userId="me")
+        .getProfile(
+            userId="me"
+        )
         .execute()
     )
 
     return {
-        "status": "gmail_connected",
-        "email": profile.get("emailAddress"),
-        "messages_total": profile.get("messagesTotal"),
-        "threads_total": profile.get("threadsTotal")
+        "status":
+            "gmail_connected",
+        "email":
+            profile.get(
+                "emailAddress"
+            ),
+        "messages_total":
+            profile.get(
+                "messagesTotal"
+            ),
+        "threads_total":
+            profile.get(
+                "threadsTotal"
+            )
     }
 
 
@@ -415,67 +723,12 @@ def test_residents():
     residents = get_residents()
 
     return {
-        "status": "registry_connected",
-        "resident_count": len(residents),
-        "residents": residents
-    }
-
-
-@app.get("/test/latest-email")
-def test_latest_email():
-    message = get_latest_inbox_message()
-
-    if not message:
-        return {
-            "status": "no_inbox_messages"
-        }
-
-    authorization = authorize_sender(
-        message["sender_email"]
-    )
-
-    return {
-        "status": "email_checked",
-        **message,
-        "authorization": authorization
-    }
-
-
-# =========================================================
-# Manual Processing Test
-# =========================================================
-
-@app.get("/test/process-latest-email")
-def process_latest_email():
-    message = get_latest_inbox_message()
-
-    if not message:
-        return {
-            "status": "no_inbox_messages"
-        }
-
-    authorization = authorize_sender(
-        message["sender_email"]
-    )
-
-    if authorization["authorized"]:
-        return {
-            "status": "authorized",
-            "action": "none",
-            "message_id": message["message_id"],
-            "sender_email": message["sender_email"],
-            "resident": authorization
-        }
-
-    sent_message = send_decline_reply(message)
-
-    return {
-        "status": "unauthorized",
-        "action": "decline_sent",
-        "message_id": message["message_id"],
-        "sender_email": message["sender_email"],
-        "sent_message_id": sent_message.get("id"),
-        "thread_id": sent_message.get("threadId")
+        "status":
+            "registry_connected",
+        "resident_count":
+            len(residents),
+        "residents":
+            residents
     }
 
 
@@ -484,132 +737,214 @@ def process_latest_email():
 # =========================================================
 
 @app.post("/webhooks/gmail")
-async def gmail_pubsub_webhook(request: Request):
+async def gmail_pubsub_webhook(
+    request: Request
+):
     global latest_gmail_notification
+    global last_history_id
 
     try:
         payload = await request.json()
 
-        pubsub_message = payload.get("message", {})
-        encoded_data = pubsub_message.get("data", "")
+        pubsub_message = payload.get(
+            "message",
+            {}
+        )
+
+        encoded_data = pubsub_message.get(
+            "data",
+            ""
+        )
 
         decoded_data = {}
 
         if encoded_data:
             padded_data = (
                 encoded_data
-                + "=" * (-len(encoded_data) % 4)
+                + "="
+                * (-len(encoded_data) % 4)
             )
 
-            decoded_bytes = base64.urlsafe_b64decode(
-                padded_data
+            decoded_bytes = (
+                base64.urlsafe_b64decode(
+                    padded_data
+                )
             )
 
             decoded_data = json.loads(
-                decoded_bytes.decode("utf-8")
+                decoded_bytes.decode(
+                    "utf-8"
+                )
             )
+
+        incoming_history_id = (
+            decoded_data.get(
+                "historyId"
+            )
+        )
 
         latest_gmail_notification = {
             "pubsub_message_id":
-                pubsub_message.get("messageId"),
+                pubsub_message.get(
+                    "messageId"
+                ),
             "publish_time":
-                pubsub_message.get("publishTime"),
+                pubsub_message.get(
+                    "publishTime"
+                ),
             "email_address":
-                decoded_data.get("emailAddress"),
-            "history_id":
-                decoded_data.get("historyId"),
-            "processing_action": None,
-            "processed_sender": None
+                decoded_data.get(
+                    "emailAddress"
+                ),
+            "incoming_history_id":
+                incoming_history_id,
+            "previous_history_id":
+                last_history_id,
+            "processing_results": []
         }
 
-        # ---------------------------------------------
-        # Automatically inspect newest inbox message
-        # ---------------------------------------------
-
-        message = get_latest_inbox_message()
-
-        if not message:
+        if not incoming_history_id:
             latest_gmail_notification[
-                "processing_action"
-            ] = "no_inbox_message"
+                "status"
+            ] = "missing_history_id"
 
             return {
-                "status": "notification_received"
+                "status":
+                    "notification_received"
             }
 
-        authorization = authorize_sender(
-            message["sender_email"]
+        # If no baseline exists, establish one.
+        # This happens after a server restart
+        # unless the watch endpoint was called.
+        if last_history_id is None:
+
+            last_history_id = (
+                incoming_history_id
+            )
+
+            latest_gmail_notification[
+                "status"
+            ] = "history_baseline_initialized"
+
+            return {
+                "status":
+                    "notification_received"
+            }
+
+        # Retrieve exact messages added
+        # since the previous Gmail history state.
+        message_ids = get_new_message_ids(
+            last_history_id
+        )
+
+        processing_results = []
+
+        for message_id in message_ids:
+            result = process_message(
+                message_id
+            )
+
+            processing_results.append(
+                result
+            )
+
+        # Advance history state only after
+        # processing this notification.
+        last_history_id = (
+            incoming_history_id
         )
 
         latest_gmail_notification[
-            "processed_sender"
-        ] = message["sender_email"]
-
-        # ---------------------------------------------
-        # Authorized resident
-        # ---------------------------------------------
-
-        if authorization["authorized"]:
-            latest_gmail_notification[
-                "processing_action"
-            ] = "authorized_resident_detected"
-
-            latest_gmail_notification[
-                "resident_id"
-            ] = authorization["resident_id"]
-
-            latest_gmail_notification[
-                "resident_name"
-            ] = authorization["name"]
-
-            return {
-                "status": "notification_received"
-            }
-
-        # ---------------------------------------------
-        # Everything else -> same fixed decline
-        # ---------------------------------------------
-
-        sent_message = send_decline_reply(message)
+            "status"
+        ] = "history_processed"
 
         latest_gmail_notification[
-            "processing_action"
-        ] = "decline_sent"
+            "processing_results"
+        ] = processing_results
 
         latest_gmail_notification[
-            "sent_message_id"
-        ] = sent_message.get("id")
+            "new_last_history_id"
+        ] = last_history_id
 
         return {
-            "status": "notification_received"
+            "status":
+                "notification_received"
+        }
+
+    except HttpError as error:
+
+        latest_gmail_notification = {
+            "status":
+                "gmail_history_error",
+            "error":
+                str(error)
+        }
+
+        return {
+            "status":
+                "notification_error"
         }
 
     except Exception as error:
+
         latest_gmail_notification = {
-            "processing_action": "error",
-            "error": str(error)
+            "status":
+                "processing_error",
+            "error":
+                str(error)
         }
 
         return {
-            "status": "notification_error",
-            "error": str(error)
+            "status":
+                "notification_error"
         }
 
 
 # =========================================================
-# Latest Automatic Notification Diagnostic
+# Diagnostics
 # =========================================================
 
 @app.get("/test/latest-notification")
 def get_latest_notification():
+
     if latest_gmail_notification is None:
         return {
-            "status": "no_notification_received"
+            "status":
+                "no_notification_received"
         }
 
     return {
-        "status": "notification_available",
-        "notification": latest_gmail_notification
+        "status":
+            "notification_available",
+        "notification":
+            latest_gmail_notification
+    }
+
+
+@app.get("/test/latest-authorized-email")
+def get_latest_authorized_email():
+
+    if latest_authorized_email is None:
+        return {
+            "status":
+                "no_authorized_email_extracted"
+        }
+
+    return {
+        "status":
+            "authorized_email_available",
+        "email":
+            latest_authorized_email
+    }
+
+
+@app.get("/test/runtime-state")
+def get_runtime_state():
+    return {
+        "last_history_id":
+            last_history_id,
+        "processed_message_count":
+            len(processed_message_ids)
     }
 
 
@@ -619,6 +954,8 @@ def get_latest_notification():
 
 @app.get("/test/start-gmail-watch")
 def start_gmail_watch():
+    global last_history_id
+
     gmail = get_gmail_service()
 
     request_body = {
@@ -626,8 +963,11 @@ def start_gmail_watch():
             "projects/residency-prepilot/"
             "topics/gmail-residency-inbox"
         ),
-        "labelIds": ["INBOX"],
-        "labelFilterBehavior": "INCLUDE"
+        "labelIds": [
+            "INBOX"
+        ],
+        "labelFilterBehavior":
+            "INCLUDE"
     }
 
     result = (
@@ -639,8 +979,19 @@ def start_gmail_watch():
         .execute()
     )
 
+    # The history ID returned by watch becomes
+    # our baseline for subsequent notifications.
+    last_history_id = (
+        result.get("historyId")
+    )
+
     return {
-        "status": "gmail_watch_started",
-        "history_id": result.get("historyId"),
-        "expiration": result.get("expiration")
+        "status":
+            "gmail_watch_started",
+        "history_id":
+            result.get("historyId"),
+        "expiration":
+            result.get("expiration"),
+        "history_baseline_saved":
+            True
     }
