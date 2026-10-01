@@ -17,6 +17,8 @@ from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
+from datetime import datetime, timezone
+
 
 app = FastAPI(title="Residency Pre-Pilot Backend")
 
@@ -381,6 +383,207 @@ def select_pilot_backlog():
 
     return active_backlogs[0]
 
+# =========================================================
+# Assignment Registry
+#
+# Assignments Sheet:
+# A = Assignment_ID
+# B = Resident_ID
+# C = Backlog_ID
+# D = Status
+# E = Assigned_At
+# F = Submitted_At
+# G = GitHub_URL
+# =========================================================
+
+def get_assignments():
+    sheets = get_sheets_service()
+
+    result = (
+        sheets.spreadsheets()
+        .values()
+        .get(
+            spreadsheetId=RESIDENT_REGISTRY_SPREADSHEET_ID,
+            range="Assignments!A:G"
+        )
+        .execute()
+    )
+
+    rows = result.get("values", [])
+
+    assignments = []
+
+    for sheet_row, row in enumerate(
+        rows[1:],
+        start=2
+    ):
+        if not row:
+            continue
+
+        assignments.append({
+            "assignment_id": (
+                row[0].strip()
+                if len(row) > 0 else ""
+            ),
+            "resident_id": (
+                row[1].strip()
+                if len(row) > 1 else ""
+            ),
+            "backlog_id": (
+                row[2].strip()
+                if len(row) > 2 else ""
+            ),
+            "status": (
+                row[3].strip().upper()
+                if len(row) > 3 else ""
+            ),
+            "assigned_at": (
+                row[4].strip()
+                if len(row) > 4 else ""
+            ),
+            "submitted_at": (
+                row[5].strip()
+                if len(row) > 5 else ""
+            ),
+            "github_url": (
+                row[6].strip()
+                if len(row) > 6 else ""
+            ),
+            "sheet_row": sheet_row
+        })
+
+    return assignments
+
+
+def get_active_assignment_for_resident(
+    resident_id
+):
+    normalized_id = (
+        resident_id.strip().upper()
+    )
+
+    for assignment in get_assignments():
+        if (
+            assignment["resident_id"].upper()
+            == normalized_id
+            and assignment["status"] == "ACTIVE"
+        ):
+            return assignment
+
+    return None
+
+
+def generate_assignment_id():
+    assignments = get_assignments()
+
+    highest_number = 0
+
+    for assignment in assignments:
+        assignment_id = (
+            assignment["assignment_id"]
+            .strip()
+            .upper()
+        )
+
+        match = re.fullmatch(
+            r"ASG(\d+)",
+            assignment_id
+        )
+
+        if match:
+            number = int(
+                match.group(1)
+            )
+
+            highest_number = max(
+                highest_number,
+                number
+            )
+
+    next_number = (
+        highest_number + 1
+    )
+
+    return f"ASG{next_number:03d}"
+
+
+def create_assignment(
+    resident_id,
+    backlog_id
+):
+    # Prevent a second ACTIVE assignment
+    # for the same resident.
+    existing = (
+        get_active_assignment_for_resident(
+            resident_id
+        )
+    )
+
+    if existing:
+        return {
+            "created": False,
+            "reason":
+                "active_assignment_already_exists",
+            "assignment":
+                existing
+        }
+
+    sheets = get_sheets_service()
+
+    assignment_id = (
+        generate_assignment_id()
+    )
+
+    assigned_at = (
+        datetime.now(timezone.utc)
+        .isoformat()
+    )
+
+    values = [[
+        assignment_id,
+        resident_id,
+        backlog_id,
+        "ACTIVE",
+        assigned_at,
+        "",
+        ""
+    ]]
+
+    result = (
+        sheets.spreadsheets()
+        .values()
+        .append(
+            spreadsheetId=
+                RESIDENT_REGISTRY_SPREADSHEET_ID,
+            range="Assignments!A:G",
+            valueInputOption="RAW",
+            insertDataOption="INSERT_ROWS",
+            body={
+                "values": values
+            }
+        )
+        .execute()
+    )
+
+    return {
+        "created": True,
+        "assignment_id":
+            assignment_id,
+        "resident_id":
+            resident_id,
+        "backlog_id":
+            backlog_id,
+        "status":
+            "ACTIVE",
+        "assigned_at":
+            assigned_at,
+        "updated_range":
+            (
+                result
+                .get("updates", {})
+                .get("updatedRange")
+            )
+    }
 
 # =========================================================
 # Resident Registry Writes
@@ -757,18 +960,44 @@ def process_ready_resident(
                 "no_active_backlog_available"
         }
 
-    assignment = (
+    # Safety check:
+    # A READY resident should not already
+    # have an ACTIVE assignment.
+    existing_assignment = (
+        get_active_assignment_for_resident(
+            resident["resident_id"]
+        )
+    )
+
+    if existing_assignment:
+        return {
+            "resident_id":
+                resident["resident_id"],
+            "action":
+                "skipped",
+            "reason":
+                "active_assignment_already_exists",
+            "assignment":
+                existing_assignment
+        }
+
+    assignment_message = (
         build_backlog_assignment_message(
             resident=resident,
             backlog=backlog
         )
     )
 
-    # Send the assignment first.
+    # -----------------------------------------------------
+    # 1. Send assignment email first.
+    # -----------------------------------------------------
+
     sent_message = send_email(
         recipient=resident["email"],
-        subject=assignment["subject"],
-        body=assignment["body"]
+        subject=
+            assignment_message["subject"],
+        body=
+            assignment_message["body"]
     )
 
     sent_message_id = (
@@ -785,12 +1014,45 @@ def process_ready_resident(
                 "assignment_email_not_confirmed"
         }
 
-    # Only update the resident after
-    # Gmail confirms successful delivery.
-    update_result = update_resident_state(
-        sheet_row=resident["sheet_row"],
-        status="ACTIVE",
-        counter=3
+    # -----------------------------------------------------
+    # 2. Persist the assignment.
+    # -----------------------------------------------------
+
+    assignment_result = (
+        create_assignment(
+            resident_id=
+                resident["resident_id"],
+            backlog_id=
+                backlog["backlog_id"]
+        )
+    )
+
+    if not assignment_result.get(
+        "created"
+    ):
+        return {
+            "resident_id":
+                resident["resident_id"],
+            "action":
+                "assignment_record_failed",
+            "sent_message_id":
+                sent_message_id,
+            "assignment_result":
+                assignment_result
+        }
+
+    # -----------------------------------------------------
+    # 3. Only after persistence succeeds,
+    #    move resident to ACTIVE / 3.
+    # -----------------------------------------------------
+
+    update_result = (
+        update_resident_state(
+            sheet_row=
+                resident["sheet_row"],
+            status="ACTIVE",
+            counter=3
+        )
     )
 
     return {
@@ -798,6 +1060,10 @@ def process_ready_resident(
             resident["resident_id"],
         "resident_email":
             resident["email"],
+        "assignment_id":
+            assignment_result[
+                "assignment_id"
+            ],
         "backlog_id":
             backlog["backlog_id"],
         "backlog_title":
@@ -812,6 +1078,8 @@ def process_ready_resident(
             "ACTIVE",
         "new_counter":
             3,
+        "assignment_record":
+            assignment_result,
         "sheet_update":
             update_result
     }
@@ -2146,7 +2414,84 @@ def get_runtime_state():
             )
     }
 
+# =========================================================
+# TEST: Repair Existing Pilot Assignment
+#
+# One-time development helper.
+# Used because BL001 was assigned before
+# assignment persistence existed.
+# =========================================================
 
+@app.get(
+    "/test/repair-assignment/{resident_id}/{backlog_id}"
+)
+def test_repair_assignment(
+    resident_id: str,
+    backlog_id: str
+):
+    resident = get_resident_by_id(
+        resident_id
+    )
+
+    if resident is None:
+        return {
+            "status":
+                "resident_not_found"
+        }
+
+    if resident["status"] != "ACTIVE":
+        return {
+            "status":
+                "repair_not_allowed",
+            "reason":
+                "resident_is_not_active",
+            "resident_status":
+                resident["status"]
+        }
+
+    existing = (
+        get_active_assignment_for_resident(
+            resident_id
+        )
+    )
+
+    if existing:
+        return {
+            "status":
+                "assignment_already_exists",
+            "assignment":
+                existing
+        }
+
+    backlog = None
+
+    for item in get_backlogs():
+        if (
+            item["backlog_id"].upper()
+            == backlog_id.upper()
+        ):
+            backlog = item
+            break
+
+    if backlog is None:
+        return {
+            "status":
+                "backlog_not_found"
+        }
+
+    result = create_assignment(
+        resident_id=
+            resident["resident_id"],
+        backlog_id=
+            backlog["backlog_id"]
+    )
+
+    return {
+        "status":
+            "assignment_repaired",
+        "result":
+            result
+    }
 # =========================================================
 # Start / Renew Gmail Inbox Watch
 # =========================================================
