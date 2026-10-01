@@ -3115,6 +3115,10 @@ async def gmail_pubsub_webhook(
                 [],
         }
 
+        # -------------------------------------------------
+        # Missing Gmail history ID
+        # -------------------------------------------------
+
         if not incoming_history_id:
             latest_gmail_notification[
                 "status"
@@ -3125,9 +3129,13 @@ async def gmail_pubsub_webhook(
                     "notification_received"
             }
 
+        # -------------------------------------------------
         # Establish baseline after restart
-        # if a Watch has not been manually
-        # initialized yet.
+        #
+        # Temporary pre-pilot behavior.
+        # Later the cursor will be persisted.
+        # -------------------------------------------------
+
         if last_history_id is None:
             last_history_id = (
                 incoming_history_id
@@ -3139,14 +3147,57 @@ async def gmail_pubsub_webhook(
                 "history_baseline_initialized"
             )
 
+            latest_gmail_notification[
+                "new_last_history_id"
+            ] = last_history_id
+
             return {
                 "status":
                     "notification_received"
             }
 
+        # -------------------------------------------------
+        # Ignore stale / duplicate Pub/Sub notifications.
+        #
+        # Gmail / Pub/Sub notifications may arrive late
+        # or out of order.
+        #
+        # The history cursor must NEVER move backwards.
+        # -------------------------------------------------
+
+        if (
+            int(incoming_history_id)
+            <= int(last_history_id)
+        ):
+            latest_gmail_notification[
+                "status"
+            ] = (
+                "stale_notification_ignored"
+            )
+
+            latest_gmail_notification[
+                "current_history_id"
+            ] = last_history_id
+
+            return {
+                "status":
+                    "notification_received",
+                "action":
+                    "stale_notification_ignored",
+            }
+
+        # -------------------------------------------------
+        # Retrieve all new INBOX messages since the
+        # previously processed history cursor.
+        # -------------------------------------------------
+
+        previous_history_id = (
+            last_history_id
+        )
+
         message_ids = (
             get_new_message_ids(
-                last_history_id
+                previous_history_id
             )
         )
 
@@ -3162,6 +3213,14 @@ async def gmail_pubsub_webhook(
             processing_results.append(
                 result
             )
+
+        # -------------------------------------------------
+        # Advance cursor only after message processing.
+        #
+        # Because incoming_history_id has already been
+        # verified as greater than last_history_id,
+        # the cursor can only move forward.
+        # -------------------------------------------------
 
         last_history_id = (
             incoming_history_id
@@ -3190,6 +3249,8 @@ async def gmail_pubsub_webhook(
                 "gmail_history_error",
             "error":
                 str(error),
+            "last_history_id":
+                last_history_id,
         }
 
         return {
@@ -3203,13 +3264,14 @@ async def gmail_pubsub_webhook(
                 "processing_error",
             "error":
                 str(error),
+            "last_history_id":
+                last_history_id,
         }
 
         return {
             "status":
                 "notification_error"
         }
-
 
 # =========================================================
 # Diagnostics
