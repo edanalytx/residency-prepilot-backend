@@ -125,6 +125,6 @@ def oauth_callback(request: Request):
 
     return {
     "status": "authorization_successful",
-    "refresh_token": credentials.refresh_token,
-    "message": "Copy the refresh token to Render. Do not share it or store it in GitHub."
+    "refresh_token_received": bool(credentials.refresh_token),
+    "message": "Google authorization completed successfully."
 }
