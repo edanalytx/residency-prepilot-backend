@@ -1824,9 +1824,20 @@ The Tech Residency Program"""
         "body": body,
     }
 
-
 # =========================================================
 # ACTIVE Scheduled Scrum Lifecycle
+#
+# Every successfully sent Scrum message opens a new
+# communication cycle.
+#
+# For each new Scrum cycle:
+#
+# - Counter decreases by one.
+# - Gmail thread ID becomes the current Scrum thread.
+# - Scrum_Replied is reset to FALSE.
+#
+# Only the first resident reply to this current thread
+# can later recover one communication point.
 # =========================================================
 
 def process_scheduled_active_resident(
@@ -1867,7 +1878,9 @@ def process_scheduled_active_resident(
     # End the active Backlog.
     # Assignment -> DISCARDED
     # Resident -> INACTIVE / 0
-    # Send closure notification.
+    #
+    # Current Scrum tracking is cleared because there
+    # is no longer an ACTIVE Scrum cycle.
     # -----------------------------------------------------
 
     if counter <= -4:
@@ -1921,6 +1934,8 @@ def process_scheduled_active_resident(
                     resident["sheet_row"],
                 status="INACTIVE",
                 counter=0,
+                scrum_thread_id="",
+                scrum_replied=False,
             )
         )
 
@@ -1947,6 +1962,10 @@ def process_scheduled_active_resident(
                 0,
             "assignment_status":
                 "DISCARDED",
+            "scrum_thread_id":
+                "",
+            "scrum_replied":
+                False,
             "assignment_update":
                 assignment_update,
             "resident_update":
@@ -2039,6 +2058,20 @@ def process_scheduled_active_resident(
         sent_message.get("id")
     )
 
+    sent_thread_id = (
+        sent_message.get("threadId")
+    )
+
+    # -----------------------------------------------------
+    # A Scrum cycle is valid only when Gmail confirms
+    # both the message and its thread.
+    #
+    # The thread ID is required to prevent:
+    #
+    # - multiple recovery credits from repeated replies
+    # - recovery credit from replies to old Scrum emails
+    # -----------------------------------------------------
+
     if not sent_message_id:
         return {
             "resident_id":
@@ -2055,9 +2088,30 @@ def process_scheduled_active_resident(
                 message_level,
         }
 
+    if not sent_thread_id:
+        return {
+            "resident_id":
+                resident["resident_id"],
+            "assignment_id":
+                assignment["assignment_id"],
+            "backlog_id":
+                backlog["backlog_id"],
+            "action":
+                "failed",
+            "reason":
+                "scrum_thread_not_confirmed",
+            "message_level":
+                message_level,
+            "sent_message_id":
+                sent_message_id,
+        }
+
     # -----------------------------------------------------
-    # Successful Scrum cycle:
-    # decrement counter by one.
+    # Successful Scrum cycle.
+    #
+    # 1. Decrement communication counter.
+    # 2. Store this Scrum's Gmail thread ID.
+    # 3. Open exactly one recovery opportunity.
     # -----------------------------------------------------
 
     new_counter = (
@@ -2068,7 +2122,12 @@ def process_scheduled_active_resident(
         update_resident_state(
             sheet_row=
                 resident["sheet_row"],
-            counter=new_counter,
+            counter=
+                new_counter,
+            scrum_thread_id=
+                sent_thread_id,
+            scrum_replied=
+                False,
         )
     )
 
@@ -2085,6 +2144,10 @@ def process_scheduled_active_resident(
             message_level,
         "sent_message_id":
             sent_message_id,
+        "scrum_thread_id":
+            sent_thread_id,
+        "scrum_replied":
+            False,
         "old_counter":
             counter,
         "new_counter":
@@ -2195,46 +2258,50 @@ def process_active_reply(
     )
 
     # -----------------------------------------------------
-    # Determine whether this reply belongs to the
-    # CURRENT Scrum cycle.
+    # Read current Scrum communication state.
     # -----------------------------------------------------
 
     current_scrum_thread_id = (
         resident.get(
-            "scrum_thread_id"
+            "scrum_thread_id",
+            ""
         )
     )
 
     incoming_thread_id = (
         message.get(
-            "thread_id"
+            "thread_id",
+            ""
         )
     )
 
     scrum_replied = (
-        str(
-            resident.get(
-                "scrum_replied",
-                ""
-            )
+        resident.get(
+            "scrum_replied",
+            False,
         )
-        .strip()
-        .upper()
-        == "TRUE"
     )
 
+    # -----------------------------------------------------
+    # Determine whether the incoming message belongs
+    # to the CURRENT Scrum cycle.
+    #
+    # Exact Gmail thread matching prevents old/backdated
+    # Scrum replies from earning recovery credit.
+    # -----------------------------------------------------
+
     is_current_scrum_thread = (
-        current_scrum_thread_id
+        bool(current_scrum_thread_id)
         and
-        incoming_thread_id
+        bool(incoming_thread_id)
         and
         incoming_thread_id
         == current_scrum_thread_id
     )
 
     # -----------------------------------------------------
-    # Decide whether this message earns one
-    # communication recovery point.
+    # Exactly one recovery point may be awarded for
+    # each current Scrum cycle.
     # -----------------------------------------------------
 
     recovery_allowed = (
@@ -2263,8 +2330,8 @@ def process_active_reply(
     # -----------------------------------------------------
     # Build acknowledgement.
     #
-    # All ACTIVE messages are acknowledged even when
-    # they do not earn another communication point.
+    # All ACTIVE resident messages are acknowledged.
+    # Communication credit is handled independently.
     # -----------------------------------------------------
 
     body = f"""Hi {first_name},
@@ -2304,11 +2371,17 @@ The Tech Residency Program"""
         }
 
     # -----------------------------------------------------
-    # Apply communication recovery only when:
+    # Apply communication recovery.
     #
-    # - this is the current Scrum thread, AND
-    # - no recovery has already been awarded for
-    #   this Scrum cycle.
+    # FIRST reply to current Scrum:
+    #   Counter +1, maximum 3
+    #   Scrum_Replied = TRUE
+    #
+    # Further replies to current Scrum:
+    #   No counter change
+    #
+    # Old/non-current Scrum replies:
+    #   No counter change
     # -----------------------------------------------------
 
     if recovery_allowed:
@@ -2331,23 +2404,40 @@ The Tech Residency Program"""
     elif is_current_scrum_thread:
 
         update_result = {
-            "updated": False,
-            "updated_cells": 0,
+            "updated":
+                False,
+            "updated_cells":
+                0,
         }
 
         reply_classification = (
             "current_scrum_additional_reply"
         )
 
-    else:
+    elif current_scrum_thread_id:
 
         update_result = {
-            "updated": False,
-            "updated_cells": 0,
+            "updated":
+                False,
+            "updated_cells":
+                0,
         }
 
         reply_classification = (
-            "old_or_noncurrent_scrum_reply"
+            "old_scrum_reply"
+        )
+
+    else:
+
+        update_result = {
+            "updated":
+                False,
+            "updated_cells":
+                0,
+        }
+
+        reply_classification = (
+            "no_current_scrum_cycle"
         )
 
     return {
@@ -2378,7 +2468,6 @@ The Tech Residency Program"""
         "sheet_update":
             update_result,
     }
-
 # =========================================================
 # Gmail Metadata Helpers
 # =========================================================
