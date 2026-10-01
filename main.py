@@ -116,7 +116,6 @@ def get_sheets_service():
         credentials=get_google_credentials(),
     )
 
-
 # =========================================================
 # Resident Registry
 #
@@ -128,6 +127,14 @@ def get_sheets_service():
 # D = Status
 # E = Counter
 # F = Mentor
+# G = Scrum_Thread_ID
+# H = Scrum_Replied
+#
+# Scrum_Replied:
+# - FALSE / blank = current Scrum cycle has not yet
+#   received communication recovery credit.
+# - TRUE = recovery credit has already been awarded
+#   for the current Scrum cycle.
 # =========================================================
 
 VALID_RESIDENT_STATUSES = {
@@ -148,8 +155,9 @@ def get_residents():
         sheets.spreadsheets()
         .values()
         .get(
-            spreadsheetId=RESIDENT_REGISTRY_SPREADSHEET_ID,
-            range="Approved_Residents!A:F",
+            spreadsheetId=
+                RESIDENT_REGISTRY_SPREADSHEET_ID,
+            range="Approved_Residents!A:H",
         )
         .execute()
     )
@@ -201,6 +209,18 @@ def get_residents():
             else ""
         )
 
+        scrum_thread_id = (
+            row[6].strip()
+            if len(row) > 6
+            else ""
+        )
+
+        scrum_replied_raw = (
+            row[7].strip().upper()
+            if len(row) > 7
+            else ""
+        )
+
         try:
             counter = (
                 int(counter_raw)
@@ -210,20 +230,37 @@ def get_residents():
         except ValueError:
             counter = None
 
+        scrum_replied = (
+            scrum_replied_raw == "TRUE"
+        )
+
         residents.append({
-            "resident_id": resident_id,
-            "name": name,
-            "email": email_address,
-            "status": status,
-            "counter": counter,
-            "mentor": mentor,
-            "sheet_row": sheet_row,
+            "resident_id":
+                resident_id,
+            "name":
+                name,
+            "email":
+                email_address,
+            "status":
+                status,
+            "counter":
+                counter,
+            "mentor":
+                mentor,
+            "scrum_thread_id":
+                scrum_thread_id,
+            "scrum_replied":
+                scrum_replied,
+            "sheet_row":
+                sheet_row,
         })
 
     return residents
 
 
-def get_resident_by_email(sender_email):
+def get_resident_by_email(
+    sender_email
+):
     normalized_email = (
         sender_email
         .strip()
@@ -231,15 +268,22 @@ def get_resident_by_email(sender_email):
     )
 
     for resident in get_residents():
-        if resident["email"] == normalized_email:
+        if (
+            resident["email"]
+            == normalized_email
+        ):
             return resident
 
     return None
 
 
-def authorize_sender(sender_email):
-    resident = get_resident_by_email(
-        sender_email
+def authorize_sender(
+    sender_email
+):
+    resident = (
+        get_resident_by_email(
+            sender_email
+        )
     )
 
     if resident is None:
@@ -248,25 +292,46 @@ def authorize_sender(sender_email):
         }
 
     return {
-        "authorized": True,
-        "resident_id": resident["resident_id"],
-        "name": resident["name"],
-        "email": resident["email"],
-        "status": resident["status"],
-        "counter": resident["counter"],
-        "mentor": resident["mentor"],
-        "sheet_row": resident["sheet_row"],
+        "authorized":
+            True,
+        "resident_id":
+            resident["resident_id"],
+        "name":
+            resident["name"],
+        "email":
+            resident["email"],
+        "status":
+            resident["status"],
+        "counter":
+            resident["counter"],
+        "mentor":
+            resident["mentor"],
+        "scrum_thread_id":
+            resident["scrum_thread_id"],
+        "scrum_replied":
+            resident["scrum_replied"],
+        "sheet_row":
+            resident["sheet_row"],
     }
 
 
 # =========================================================
 # Resident Registry Writes
+#
+# Optional fields are updated only when explicitly
+# provided.
+#
+# Scrum fields:
+# G = Scrum_Thread_ID
+# H = Scrum_Replied
 # =========================================================
 
 def update_resident_state(
     sheet_row,
     status=None,
     counter=None,
+    scrum_thread_id=None,
+    scrum_replied=None,
 ):
     if status is not None:
         status = (
@@ -275,34 +340,95 @@ def update_resident_state(
             .upper()
         )
 
-        if status not in VALID_RESIDENT_STATUSES:
+        if (
+            status
+            not in VALID_RESIDENT_STATUSES
+        ):
             raise ValueError(
-                f"Invalid resident status: {status}"
+                f"Invalid resident status: "
+                f"{status}"
             )
 
     sheets = get_sheets_service()
 
     updates = []
 
+    # -----------------------------------------------------
+    # Status
+    # -----------------------------------------------------
+
     if status is not None:
         updates.append({
             "range":
-                f"Approved_Residents!D{sheet_row}",
-            "values": [[status]],
+                f"Approved_Residents!"
+                f"D{sheet_row}",
+            "values":
+                [[status]],
         })
+
+    # -----------------------------------------------------
+    # Communication counter
+    # -----------------------------------------------------
 
     if counter is not None:
         updates.append({
             "range":
-                f"Approved_Residents!E{sheet_row}",
-            "values": [[counter]],
+                f"Approved_Residents!"
+                f"E{sheet_row}",
+            "values":
+                [[counter]],
         })
+
+    # -----------------------------------------------------
+    # Current Scrum Gmail thread
+    #
+    # Passing an empty string intentionally clears
+    # the current Scrum thread.
+    # -----------------------------------------------------
+
+    if scrum_thread_id is not None:
+        updates.append({
+            "range":
+                f"Approved_Residents!"
+                f"G{sheet_row}",
+            "values":
+                [[str(scrum_thread_id)]],
+        })
+
+    # -----------------------------------------------------
+    # Current Scrum recovery status
+    # -----------------------------------------------------
+
+    if scrum_replied is not None:
+        scrum_replied_value = (
+            "TRUE"
+            if bool(scrum_replied)
+            else "FALSE"
+        )
+
+        updates.append({
+            "range":
+                f"Approved_Residents!"
+                f"H{sheet_row}",
+            "values":
+                [[scrum_replied_value]],
+        })
+
+    # -----------------------------------------------------
+    # Nothing to update
+    # -----------------------------------------------------
 
     if not updates:
         return {
-            "updated": False,
-            "updated_cells": 0,
+            "updated":
+                False,
+            "updated_cells":
+                0,
         }
+
+    # -----------------------------------------------------
+    # Perform all requested resident updates together.
+    # -----------------------------------------------------
 
     result = (
         sheets.spreadsheets()
@@ -311,23 +437,24 @@ def update_resident_state(
             spreadsheetId=
                 RESIDENT_REGISTRY_SPREADSHEET_ID,
             body={
-                "valueInputOption": "RAW",
-                "data": updates,
+                "valueInputOption":
+                    "RAW",
+                "data":
+                    updates,
             },
         )
         .execute()
     )
 
     return {
-        "updated": True,
+        "updated":
+            True,
         "updated_cells":
             result.get(
                 "totalUpdatedCells",
                 0,
             ),
     }
-
-
 # =========================================================
 # Backlog Catalog
 #
@@ -2011,6 +2138,23 @@ def process_all_active_residents():
 #
 # Static Scrum response for now.
 #
+# Communication recovery policy:
+#
+# 1. Only a reply belonging to the CURRENT Scrum thread
+#    can recover a communication point.
+#
+# 2. Only the FIRST valid reply in that Scrum cycle
+#    can recover a point.
+#
+# 3. Additional replies in the same Scrum cycle
+#    are acknowledged but do not recover more points.
+#
+# 4. Replies to older Scrum threads are acknowledged
+#    but do not recover communication points.
+#
+# 5. A valid recovery increases the counter by 1,
+#    capped at 3.
+#
 # THIS is the future Scrum AI insertion point.
 # =========================================================
 
@@ -2050,6 +2194,79 @@ def process_active_reply(
         else "Resident"
     )
 
+    # -----------------------------------------------------
+    # Determine whether this reply belongs to the
+    # CURRENT Scrum cycle.
+    # -----------------------------------------------------
+
+    current_scrum_thread_id = (
+        resident.get(
+            "scrum_thread_id"
+        )
+    )
+
+    incoming_thread_id = (
+        message.get(
+            "thread_id"
+        )
+    )
+
+    scrum_replied = (
+        str(
+            resident.get(
+                "scrum_replied",
+                ""
+            )
+        )
+        .strip()
+        .upper()
+        == "TRUE"
+    )
+
+    is_current_scrum_thread = (
+        current_scrum_thread_id
+        and
+        incoming_thread_id
+        and
+        incoming_thread_id
+        == current_scrum_thread_id
+    )
+
+    # -----------------------------------------------------
+    # Decide whether this message earns one
+    # communication recovery point.
+    # -----------------------------------------------------
+
+    recovery_allowed = (
+        is_current_scrum_thread
+        and
+        not scrum_replied
+    )
+
+    current_counter = (
+        resident["counter"]
+    )
+
+    if current_counter is None:
+        current_counter = 3
+
+    if recovery_allowed:
+        new_counter = min(
+            current_counter + 1,
+            3,
+        )
+    else:
+        new_counter = (
+            current_counter
+        )
+
+    # -----------------------------------------------------
+    # Build acknowledgement.
+    #
+    # All ACTIVE messages are acknowledged even when
+    # they do not earn another communication point.
+    # -----------------------------------------------------
+
     body = f"""Hi {first_name},
 
 Thanks for the update on {backlog['backlog_id']} — {backlog['title']}.
@@ -2086,12 +2303,52 @@ The Tech Residency Program"""
                 "scrum_reply_not_confirmed",
         }
 
-    update_result = (
-        update_resident_state(
-            sheet_row=
-                resident["sheet_row"],
+    # -----------------------------------------------------
+    # Apply communication recovery only when:
+    #
+    # - this is the current Scrum thread, AND
+    # - no recovery has already been awarded for
+    #   this Scrum cycle.
+    # -----------------------------------------------------
+
+    if recovery_allowed:
+
+        update_result = (
+            update_resident_state(
+                sheet_row=
+                    resident["sheet_row"],
+                counter=
+                    new_counter,
+                scrum_replied=
+                    True,
+            )
         )
-    )
+
+        reply_classification = (
+            "current_scrum_first_reply"
+        )
+
+    elif is_current_scrum_thread:
+
+        update_result = {
+            "updated": False,
+            "updated_cells": 0,
+        }
+
+        reply_classification = (
+            "current_scrum_additional_reply"
+        )
+
+    else:
+
+        update_result = {
+            "updated": False,
+            "updated_cells": 0,
+        }
+
+        reply_classification = (
+            "old_or_noncurrent_scrum_reply"
+        )
 
     return {
         "resident_id":
@@ -2102,16 +2359,25 @@ The Tech Residency Program"""
             backlog["backlog_id"],
         "action":
             "scrum_reply_sent",
+        "reply_classification":
+            reply_classification,
         "sent_message_id":
             sent_message_id,
         "status":
             "ACTIVE",
-        "counter_reset_to":
-            3,
+        "current_scrum_thread_id":
+            current_scrum_thread_id,
+        "incoming_thread_id":
+            incoming_thread_id,
+        "communication_recovery_awarded":
+            recovery_allowed,
+        "old_counter":
+            current_counter,
+        "new_counter":
+            new_counter,
         "sheet_update":
             update_result,
     }
-
 
 # =========================================================
 # Gmail Metadata Helpers
