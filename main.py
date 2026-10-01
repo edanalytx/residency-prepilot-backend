@@ -14,9 +14,9 @@ from google_auth_oauthlib.flow import Flow
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 
-from fastapi import FastAPI, Request
 
 app = FastAPI(title="Residency Pre-Pilot Backend")
+
 latest_gmail_notification = None
 
 
@@ -150,24 +150,21 @@ def authorize_sender(sender_email):
 
     for resident in get_residents():
 
-        if resident["email"] == normalized_email:
-
-            if resident["active"] == "TRUE":
-                return {
-                    "authorized": True,
-                    "resident_id": resident["resident_id"],
-                    "name": resident["name"],
-                    "email": resident["email"]
-                }
-
+        if (
+            resident["email"] == normalized_email
+            and resident["active"] == "TRUE"
+        ):
             return {
-                "authorized": False,
-                "reason": "inactive"
+                "authorized": True,
+                "resident_id": resident["resident_id"],
+                "name": resident["name"],
+                "email": resident["email"]
             }
 
+    # FALSE, inactive, missing, or not listed:
+    # all treated identically.
     return {
-        "authorized": False,
-        "reason": "not_registered"
+        "authorized": False
     }
 
 
@@ -424,10 +421,6 @@ def test_residents():
     }
 
 
-# =========================================================
-# Latest Email Authorization Test
-# =========================================================
-
 @app.get("/test/latest-email")
 def test_latest_email():
     message = get_latest_inbox_message()
@@ -465,8 +458,6 @@ def process_latest_email():
         message["sender_email"]
     )
 
-    # Authorized resident:
-    # Do not send anything yet.
     if authorization["authorized"]:
         return {
             "status": "authorized",
@@ -476,8 +467,6 @@ def process_latest_email():
             "resident": authorization
         }
 
-    # Unauthorized/inactive sender:
-    # Fixed deterministic decline reply.
     sent_message = send_decline_reply(message)
 
     return {
@@ -485,11 +474,11 @@ def process_latest_email():
         "action": "decline_sent",
         "message_id": message["message_id"],
         "sender_email": message["sender_email"],
-        "internal_reason": authorization["reason"],
         "sent_message_id": sent_message.get("id"),
         "thread_id": sent_message.get("threadId")
     }
-    
+
+
 # =========================================================
 # Gmail Pub/Sub Webhook
 # =========================================================
@@ -528,19 +517,88 @@ async def gmail_pubsub_webhook(request: Request):
             "email_address":
                 decoded_data.get("emailAddress"),
             "history_id":
-                decoded_data.get("historyId")
+                decoded_data.get("historyId"),
+            "processing_action": None,
+            "processed_sender": None
         }
+
+        # ---------------------------------------------
+        # Automatically inspect newest inbox message
+        # ---------------------------------------------
+
+        message = get_latest_inbox_message()
+
+        if not message:
+            latest_gmail_notification[
+                "processing_action"
+            ] = "no_inbox_message"
+
+            return {
+                "status": "notification_received"
+            }
+
+        authorization = authorize_sender(
+            message["sender_email"]
+        )
+
+        latest_gmail_notification[
+            "processed_sender"
+        ] = message["sender_email"]
+
+        # ---------------------------------------------
+        # Authorized resident
+        # ---------------------------------------------
+
+        if authorization["authorized"]:
+            latest_gmail_notification[
+                "processing_action"
+            ] = "authorized_resident_detected"
+
+            latest_gmail_notification[
+                "resident_id"
+            ] = authorization["resident_id"]
+
+            latest_gmail_notification[
+                "resident_name"
+            ] = authorization["name"]
+
+            return {
+                "status": "notification_received"
+            }
+
+        # ---------------------------------------------
+        # Everything else -> same fixed decline
+        # ---------------------------------------------
+
+        sent_message = send_decline_reply(message)
+
+        latest_gmail_notification[
+            "processing_action"
+        ] = "decline_sent"
+
+        latest_gmail_notification[
+            "sent_message_id"
+        ] = sent_message.get("id")
 
         return {
             "status": "notification_received"
         }
 
     except Exception as error:
+        latest_gmail_notification = {
+            "processing_action": "error",
+            "error": str(error)
+        }
+
         return {
             "status": "notification_error",
             "error": str(error)
         }
 
+
+# =========================================================
+# Latest Automatic Notification Diagnostic
+# =========================================================
 
 @app.get("/test/latest-notification")
 def get_latest_notification():
@@ -553,9 +611,10 @@ def get_latest_notification():
         "status": "notification_available",
         "notification": latest_gmail_notification
     }
-    
+
+
 # =========================================================
-# Start Gmail Inbox Watch
+# Start / Renew Gmail Inbox Watch
 # =========================================================
 
 @app.get("/test/start-gmail-watch")
