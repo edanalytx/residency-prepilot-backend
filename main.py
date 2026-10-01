@@ -114,7 +114,6 @@ def get_sheets_service():
 
 # =========================================================
 # Resident Registry
-# Sheet structure:
 #
 # A = Resident_ID
 # B = Name
@@ -225,10 +224,23 @@ def get_resident_by_email(sender_email):
     )
 
     for resident in get_residents():
+        if resident["email"] == normalized_email:
+            return resident
 
+    return None
+
+
+def get_resident_by_id(resident_id):
+    normalized_id = (
+        resident_id
+        .strip()
+        .upper()
+    )
+
+    for resident in get_residents():
         if (
-            resident["email"]
-            == normalized_email
+            resident["resident_id"].upper()
+            == normalized_id
         ):
             return resident
 
@@ -247,20 +259,13 @@ def authorize_sender(sender_email):
 
     return {
         "authorized": True,
-        "resident_id":
-            resident["resident_id"],
-        "name":
-            resident["name"],
-        "email":
-            resident["email"],
-        "status":
-            resident["status"],
-        "counter":
-            resident["counter"],
-        "mentor":
-            resident["mentor"],
-        "sheet_row":
-            resident["sheet_row"]
+        "resident_id": resident["resident_id"],
+        "name": resident["name"],
+        "email": resident["email"],
+        "status": resident["status"],
+        "counter": resident["counter"],
+        "mentor": resident["mentor"],
+        "sheet_row": resident["sheet_row"]
     }
 
 
@@ -332,6 +337,204 @@ def update_resident_state(
                 "totalUpdatedCells",
                 0
             )
+    }
+
+
+# =========================================================
+# Generic Outgoing Email
+# =========================================================
+
+def send_email(
+    recipient,
+    subject,
+    body
+):
+    gmail = get_gmail_service()
+
+    email_message = EmailMessage()
+
+    email_message["To"] = recipient
+    email_message["Subject"] = subject
+
+    email_message.set_content(body)
+
+    encoded_message = (
+        base64.urlsafe_b64encode(
+            email_message.as_bytes()
+        )
+        .decode()
+    )
+
+    sent_message = (
+        gmail.users()
+        .messages()
+        .send(
+            userId="me",
+            body={
+                "raw": encoded_message
+            }
+        )
+        .execute()
+    )
+
+    return sent_message
+
+
+# =========================================================
+# Welcome Template
+# JOINED -> PENDING
+# =========================================================
+
+def build_welcome_message(resident):
+    first_name = (
+        resident["name"]
+        .strip()
+        .split()[0]
+        if resident["name"].strip()
+        else "Resident"
+    )
+
+    subject = (
+        "Welcome to The Tech Residency Program"
+    )
+
+    body = f"""Hi {first_name},
+
+Welcome to The Tech Residency Program (TTRP). Glad to have you with us.
+
+Before we get you started, I'd like to know a little about your current technical background. Please reply to this email with the following:
+
+- Your preferred area(s) of work
+- Programming languages you are comfortable with
+- Technologies/tools you have worked with
+- Your GitHub username/profile
+- A short description of any project you have previously worked on
+
+Don't worry about having experience in everything. This information simply helps us understand where you're starting from.
+
+Once we receive your response, we'll complete your onboarding and get you ready for your first assignment.
+
+Regards,
+John Doe
+Tech Lead
+The Tech Residency Program"""
+
+    return {
+        "subject": subject,
+        "body": body
+    }
+
+
+# =========================================================
+# First Residency Workflow
+# JOINED -> Welcome Email -> PENDING
+# =========================================================
+
+def process_joined_resident(resident):
+    if resident["status"] != "JOINED":
+        return {
+            "resident_id":
+                resident["resident_id"],
+            "action":
+                "skipped",
+            "reason":
+                "resident_not_joined"
+        }
+
+    if not resident["email"]:
+        return {
+            "resident_id":
+                resident["resident_id"],
+            "action":
+                "failed",
+            "reason":
+                "resident_email_missing"
+        }
+
+    welcome = build_welcome_message(
+        resident
+    )
+
+    # IMPORTANT:
+    # Send first.
+    # Change status only after Gmail confirms success.
+    sent_message = send_email(
+        recipient=resident["email"],
+        subject=welcome["subject"],
+        body=welcome["body"]
+    )
+
+    sent_message_id = (
+        sent_message.get("id")
+    )
+
+    if not sent_message_id:
+        return {
+            "resident_id":
+                resident["resident_id"],
+            "action":
+                "failed",
+            "reason":
+                "gmail_send_not_confirmed"
+        }
+
+    update_result = update_resident_state(
+        sheet_row=resident["sheet_row"],
+        status="PENDING"
+    )
+
+    return {
+        "resident_id":
+            resident["resident_id"],
+        "resident_email":
+            resident["email"],
+        "action":
+            "welcome_sent",
+        "sent_message_id":
+            sent_message_id,
+        "old_status":
+            "JOINED",
+        "new_status":
+            "PENDING",
+        "sheet_update":
+            update_result
+    }
+
+
+def process_all_joined_residents():
+    residents = get_residents()
+
+    joined_residents = [
+        resident
+        for resident in residents
+        if resident["status"] == "JOINED"
+    ]
+
+    results = []
+
+    for resident in joined_residents:
+        try:
+            result = process_joined_resident(
+                resident
+            )
+
+        except Exception as error:
+            result = {
+                "resident_id":
+                    resident["resident_id"],
+                "action":
+                    "failed",
+                "error":
+                    str(error)
+            }
+
+        results.append(result)
+
+    return {
+        "joined_resident_count":
+            len(joined_residents),
+        "results":
+            results
     }
 
 
@@ -608,7 +811,6 @@ def send_decline_reply(message):
     )
 
     if message["rfc_message_id"]:
-
         email_message["In-Reply-To"] = (
             message["rfc_message_id"]
         )
@@ -656,11 +858,9 @@ def get_new_message_ids(
     gmail = get_gmail_service()
 
     message_ids = set()
-
     page_token = None
 
     while True:
-
         request = (
             gmail.users()
             .history()
@@ -677,9 +877,7 @@ def get_new_message_ids(
             )
         )
 
-        result = (
-            request.execute()
-        )
+        result = request.execute()
 
         for history_record in (
             result.get(
@@ -687,7 +885,6 @@ def get_new_message_ids(
                 []
             )
         ):
-
             for added in (
                 history_record.get(
                     "messagesAdded",
@@ -714,8 +911,7 @@ def get_new_message_ids(
 
                 if (
                     message_id
-                    and "INBOX"
-                    in label_ids
+                    and "INBOX" in label_ids
                 ):
                     message_ids.add(
                         message_id
@@ -753,16 +949,12 @@ def process_message(message_id):
                 "duplicate_ignored"
         }
 
-    # Metadata first.
-    # Body has NOT been retrieved yet.
     message = (
         get_message_metadata(
             message_id
         )
     )
 
-    # Safety check:
-    # only process INBOX messages.
     if (
         "INBOX"
         not in message["label_ids"]
@@ -790,7 +982,6 @@ def process_message(message_id):
     # -----------------------------------------------------
 
     if not authorization["authorized"]:
-
         sent_message = (
             send_decline_reply(
                 message
@@ -814,7 +1005,7 @@ def process_message(message_id):
 
     # -----------------------------------------------------
     # Registered resident.
-    # Only NOW retrieve full content.
+    # Only now retrieve full content.
     # -----------------------------------------------------
 
     full_message = (
@@ -934,14 +1125,16 @@ def google_auth():
     )
 
     authorization_url, _ = (
-    flow.authorization_url(
-        access_type="offline",
-        prompt="consent",
-        state=state,
-        code_challenge=code_challenge,
-        code_challenge_method="S256",
+        flow.authorization_url(
+            access_type="offline",
+            prompt="consent",
+            state=state,
+            code_challenge=
+                code_challenge,
+            code_challenge_method=
+                "S256",
+        )
     )
-)
 
     return RedirectResponse(
         authorization_url
@@ -1001,16 +1194,15 @@ def oauth_callback(
         )
     )
 
-    credentials = (
-        flow.credentials
-    )
+    credentials = flow.credentials
 
     return {
         "status":
             "authorization_successful",
         "refresh_token_received":
-            bool(credentials.refresh_token),
-            #credentials.refresh_token,
+            bool(
+                credentials.refresh_token
+            ),
         "message":
             "Google authorization "
             "completed successfully."
@@ -1067,16 +1259,6 @@ def test_residents():
 
 # =========================================================
 # Temporary State-Write Test
-#
-# This endpoint lets us prove that the new OAuth credential
-# can WRITE to Google Sheets.
-#
-# It does not change anything unless values are supplied.
-#
-# Example:
-# /test/update-resident-state/R001?status=JOINED
-#
-# Later this test endpoint can be removed.
 # =========================================================
 
 @app.get(
@@ -1087,18 +1269,8 @@ def test_update_resident_state(
     status: str = None,
     counter: int = None
 ):
-    residents = get_residents()
-
-    resident = next(
-        (
-            item
-            for item in residents
-            if (
-                item["resident_id"]
-                == resident_id
-            )
-        ),
-        None
+    resident = get_resident_by_id(
+        resident_id
     )
 
     if resident is None:
@@ -1149,6 +1321,43 @@ def test_update_resident_state(
         "result":
             result
     }
+
+
+# =========================================================
+# TEST: Process JOINED Residents
+#
+# For development only.
+# Later this function will be triggered by the orchestrator.
+# =========================================================
+
+@app.get("/test/process-joined")
+def test_process_joined():
+    try:
+        result = (
+            process_all_joined_residents()
+        )
+
+        return {
+            "status":
+                "joined_processing_complete",
+            **result
+        }
+
+    except HttpError as error:
+        return {
+            "status":
+                "google_api_error",
+            "error":
+                str(error)
+        }
+
+    except Exception as error:
+        return {
+            "status":
+                "processing_error",
+            "error":
+                str(error)
+        }
 
 
 # =========================================================
@@ -1232,7 +1441,6 @@ async def gmail_pubsub_webhook(
         }
 
         if not incoming_history_id:
-
             latest_gmail_notification[
                 "status"
             ] = "missing_history_id"
@@ -1242,10 +1450,7 @@ async def gmail_pubsub_webhook(
                     "notification_received"
             }
 
-        # If no baseline exists,
-        # establish one.
         if last_history_id is None:
-
             last_history_id = (
                 incoming_history_id
             )
@@ -1261,8 +1466,6 @@ async def gmail_pubsub_webhook(
                     "notification_received"
             }
 
-        # Retrieve exact messages added
-        # since previous Gmail history state.
         message_ids = (
             get_new_message_ids(
                 last_history_id
@@ -1272,7 +1475,6 @@ async def gmail_pubsub_webhook(
         processing_results = []
 
         for message_id in message_ids:
-
             result = (
                 process_message(
                     message_id
@@ -1283,8 +1485,6 @@ async def gmail_pubsub_webhook(
                 result
             )
 
-        # Advance history state only
-        # after processing.
         last_history_id = (
             incoming_history_id
         )
@@ -1307,7 +1507,6 @@ async def gmail_pubsub_webhook(
         }
 
     except HttpError as error:
-
         latest_gmail_notification = {
             "status":
                 "gmail_history_error",
@@ -1321,7 +1520,6 @@ async def gmail_pubsub_webhook(
         }
 
     except Exception as error:
-
         latest_gmail_notification = {
             "status":
                 "processing_error",
@@ -1422,8 +1620,6 @@ def start_gmail_watch():
         .execute()
     )
 
-    # History ID returned by watch
-    # becomes our baseline.
     last_history_id = (
         result.get(
             "historyId"
