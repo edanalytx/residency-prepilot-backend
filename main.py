@@ -1009,9 +1009,8 @@ def oauth_callback(
         "status":
             "authorization_successful",
         "refresh_token_received":
-            bool(
-                credentials.refresh_token
-            ),
+            #bool(credentials.refresh_token),
+            credentials.refresh_token,
         "message":
             "Google authorization "
             "completed successfully."
