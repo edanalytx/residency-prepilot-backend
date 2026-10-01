@@ -2090,7 +2090,6 @@ The Tech Residency Program"""
         update_resident_state(
             sheet_row=
                 resident["sheet_row"],
-            counter=3,
         )
     )
 
