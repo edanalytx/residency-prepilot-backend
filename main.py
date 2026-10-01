@@ -17,6 +17,7 @@ from googleapiclient.discovery import build
 from fastapi import FastAPI, Request
 
 app = FastAPI(title="Residency Pre-Pilot Backend")
+latest_gmail_notification = None
 
 
 # =========================================================
@@ -495,23 +496,64 @@ def process_latest_email():
 
 @app.post("/webhooks/gmail")
 async def gmail_pubsub_webhook(request: Request):
+    global latest_gmail_notification
+
     try:
         payload = await request.json()
 
-        return {
-            "status": "notification_received",
-            "pubsub_message_id": (
-                payload
-                .get("message", {})
-                .get("messageId")
+        pubsub_message = payload.get("message", {})
+        encoded_data = pubsub_message.get("data", "")
+
+        decoded_data = {}
+
+        if encoded_data:
+            padded_data = (
+                encoded_data
+                + "=" * (-len(encoded_data) % 4)
             )
+
+            decoded_bytes = base64.urlsafe_b64decode(
+                padded_data
+            )
+
+            decoded_data = json.loads(
+                decoded_bytes.decode("utf-8")
+            )
+
+        latest_gmail_notification = {
+            "pubsub_message_id":
+                pubsub_message.get("messageId"),
+            "publish_time":
+                pubsub_message.get("publishTime"),
+            "email_address":
+                decoded_data.get("emailAddress"),
+            "history_id":
+                decoded_data.get("historyId")
         }
 
-    except Exception:
         return {
             "status": "notification_received"
         }
 
+    except Exception as error:
+        return {
+            "status": "notification_error",
+            "error": str(error)
+        }
+
+
+@app.get("/test/latest-notification")
+def get_latest_notification():
+    if latest_gmail_notification is None:
+        return {
+            "status": "no_notification_received"
+        }
+
+    return {
+        "status": "notification_available",
+        "notification": latest_gmail_notification
+    }
+    
 # =========================================================
 # Start Gmail Inbox Watch
 # =========================================================
