@@ -24,6 +24,10 @@ GOOGLE_CLIENT_SECRET = os.environ["GOOGLE_CLIENT_SECRET"]
 GOOGLE_REDIRECT_URI = os.environ["GOOGLE_REDIRECT_URI"]
 GOOGLE_REFRESH_TOKEN = os.environ["GOOGLE_REFRESH_TOKEN"]
 
+RESIDENT_REGISTRY_SPREADSHEET_ID = os.environ[
+    "RESIDENT_REGISTRY_SPREADSHEET_ID"
+]
+
 
 # ---------------------------------------------------------
 # Google API Scopes
@@ -59,7 +63,22 @@ def create_flow():
 
 
 # ---------------------------------------------------------
-# Basic Service Endpoints
+# Stored Google Credentials
+# ---------------------------------------------------------
+
+def get_google_credentials():
+    return Credentials(
+        token=None,
+        refresh_token=GOOGLE_REFRESH_TOKEN,
+        token_uri="https://oauth2.googleapis.com/token",
+        client_id=GOOGLE_CLIENT_ID,
+        client_secret=GOOGLE_CLIENT_SECRET,
+        scopes=SCOPES,
+    )
+
+
+# ---------------------------------------------------------
+# Basic Endpoints
 # ---------------------------------------------------------
 
 @app.get("/")
@@ -85,7 +104,6 @@ def health():
 def google_auth():
     flow = create_flow()
 
-    # Generate PKCE code verifier
     code_verifier = secrets.token_urlsafe(64)
 
     digest = hashlib.sha256(
@@ -98,7 +116,6 @@ def google_auth():
         .rstrip("=")
     )
 
-    # Carry verifier through OAuth round trip
     state_data = {
         "cv": code_verifier
     }
@@ -151,7 +168,6 @@ def oauth_callback(request: Request):
         }
 
     flow = create_flow()
-
     flow.code_verifier = code_verifier
 
     flow.fetch_token(
@@ -161,34 +177,21 @@ def oauth_callback(request: Request):
     credentials = flow.credentials
 
     return {
-    "status": "authorization_successful",
-    "refresh_token_received": bool(credentials.refresh_token),
-    "message": "Google authorization completed successfully."
-}
+        "status": "authorization_successful",
+        "refresh_token_received": bool(
+            credentials.refresh_token
+        ),
+        "message": "Google authorization completed successfully."
+    }
 
 
 # ---------------------------------------------------------
-# Gmail Credentials
-# ---------------------------------------------------------
-
-def get_gmail_credentials():
-    return Credentials(
-        token=None,
-        refresh_token=GOOGLE_REFRESH_TOKEN,
-        token_uri="https://oauth2.googleapis.com/token",
-        client_id=GOOGLE_CLIENT_ID,
-        client_secret=GOOGLE_CLIENT_SECRET,
-        scopes=SCOPES,
-    )
-
-
-# ---------------------------------------------------------
-# Gmail Connection Test
+# Gmail Test
 # ---------------------------------------------------------
 
 @app.get("/test/gmail")
 def test_gmail():
-    credentials = get_gmail_credentials()
+    credentials = get_google_credentials()
 
     gmail = build(
         "gmail",
@@ -207,4 +210,57 @@ def test_gmail():
         "email": profile.get("emailAddress"),
         "messages_total": profile.get("messagesTotal"),
         "threads_total": profile.get("threadsTotal")
+    }
+
+
+# ---------------------------------------------------------
+# Resident Registry Test
+# ---------------------------------------------------------
+
+@app.get("/test/residents")
+def test_residents():
+    credentials = get_google_credentials()
+
+    sheets = build(
+        "sheets",
+        "v4",
+        credentials=credentials
+    )
+
+    result = (
+        sheets.spreadsheets()
+        .values()
+        .get(
+            spreadsheetId=RESIDENT_REGISTRY_SPREADSHEET_ID,
+            range="Approved_Residents!A:D"
+        )
+        .execute()
+    )
+
+    rows = result.get("values", [])
+
+    if not rows:
+        return {
+            "status": "registry_connected",
+            "resident_count": 0,
+            "residents": []
+        }
+
+    residents = []
+
+    for row in rows[1:]:
+        if not row:
+            continue
+
+        residents.append({
+            "resident_id": row[0] if len(row) > 0 else "",
+            "name": row[1] if len(row) > 1 else "",
+            "email": row[2] if len(row) > 2 else "",
+            "active": row[3] if len(row) > 3 else ""
+        })
+
+    return {
+        "status": "registry_connected",
+        "resident_count": len(residents),
+        "residents": residents
     }
