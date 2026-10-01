@@ -6,6 +6,7 @@ import json
 import html
 import re
 
+from datetime import datetime, timezone
 from email.utils import parseaddr
 from email.message import EmailMessage
 
@@ -17,15 +18,17 @@ from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
-from datetime import datetime, timezone
-
 
 app = FastAPI(title="Residency Pre-Pilot Backend")
 
 
 # =========================================================
 # Temporary Runtime State
-# Later this will move to persistent storage.
+#
+# Later:
+# - Gmail history cursor
+# - processed message IDs
+# will move to persistent storage.
 # =========================================================
 
 latest_gmail_notification = None
@@ -56,7 +59,7 @@ RESIDENT_REGISTRY_SPREADSHEET_ID = os.environ[
 
 SCOPES = [
     "https://www.googleapis.com/auth/gmail.modify",
-    "https://www.googleapis.com/auth/spreadsheets"
+    "https://www.googleapis.com/auth/spreadsheets",
 ]
 
 
@@ -102,7 +105,7 @@ def get_gmail_service():
     return build(
         "gmail",
         "v1",
-        credentials=get_google_credentials()
+        credentials=get_google_credentials(),
     )
 
 
@@ -110,12 +113,14 @@ def get_sheets_service():
     return build(
         "sheets",
         "v4",
-        credentials=get_google_credentials()
+        credentials=get_google_credentials(),
     )
 
 
 # =========================================================
 # Resident Registry
+#
+# Approved_Residents
 #
 # A = Resident_ID
 # B = Name
@@ -144,7 +149,7 @@ def get_residents():
         .values()
         .get(
             spreadsheetId=RESIDENT_REGISTRY_SPREADSHEET_ID,
-            range="Approved_Residents!A:F"
+            range="Approved_Residents!A:F",
         )
         .execute()
     )
@@ -155,7 +160,7 @@ def get_residents():
 
     for sheet_row, row in enumerate(
         rows[1:],
-        start=2
+        start=2,
     ):
         if not row:
             continue
@@ -212,7 +217,7 @@ def get_residents():
             "status": status,
             "counter": counter,
             "mentor": mentor,
-            "sheet_row": sheet_row
+            "sheet_row": sheet_row,
         })
 
     return residents
@@ -227,23 +232,6 @@ def get_resident_by_email(sender_email):
 
     for resident in get_residents():
         if resident["email"] == normalized_email:
-            return resident
-
-    return None
-
-
-def get_resident_by_id(resident_id):
-    normalized_id = (
-        resident_id
-        .strip()
-        .upper()
-    )
-
-    for resident in get_residents():
-        if (
-            resident["resident_id"].upper()
-            == normalized_id
-        ):
             return resident
 
     return None
@@ -267,13 +255,84 @@ def authorize_sender(sender_email):
         "status": resident["status"],
         "counter": resident["counter"],
         "mentor": resident["mentor"],
-        "sheet_row": resident["sheet_row"]
+        "sheet_row": resident["sheet_row"],
     }
+
+
+# =========================================================
+# Resident Registry Writes
+# =========================================================
+
+def update_resident_state(
+    sheet_row,
+    status=None,
+    counter=None,
+):
+    if status is not None:
+        status = (
+            str(status)
+            .strip()
+            .upper()
+        )
+
+        if status not in VALID_RESIDENT_STATUSES:
+            raise ValueError(
+                f"Invalid resident status: {status}"
+            )
+
+    sheets = get_sheets_service()
+
+    updates = []
+
+    if status is not None:
+        updates.append({
+            "range":
+                f"Approved_Residents!D{sheet_row}",
+            "values": [[status]],
+        })
+
+    if counter is not None:
+        updates.append({
+            "range":
+                f"Approved_Residents!E{sheet_row}",
+            "values": [[counter]],
+        })
+
+    if not updates:
+        return {
+            "updated": False,
+            "updated_cells": 0,
+        }
+
+    result = (
+        sheets.spreadsheets()
+        .values()
+        .batchUpdate(
+            spreadsheetId=
+                RESIDENT_REGISTRY_SPREADSHEET_ID,
+            body={
+                "valueInputOption": "RAW",
+                "data": updates,
+            },
+        )
+        .execute()
+    )
+
+    return {
+        "updated": True,
+        "updated_cells":
+            result.get(
+                "totalUpdatedCells",
+                0,
+            ),
+    }
+
 
 # =========================================================
 # Backlog Catalog
 #
-# Backlogs Sheet:
+# Backlogs
+#
 # A = Backlog_ID
 # B = Title
 # C = Project
@@ -291,8 +350,9 @@ def get_backlogs():
         sheets.spreadsheets()
         .values()
         .get(
-            spreadsheetId=RESIDENT_REGISTRY_SPREADSHEET_ID,
-            range="Backlogs!A:H"
+            spreadsheetId=
+                RESIDENT_REGISTRY_SPREADSHEET_ID,
+            range="Backlogs!A:H",
         )
         .execute()
     )
@@ -303,12 +363,12 @@ def get_backlogs():
 
     for sheet_row, row in enumerate(
         rows[1:],
-        start=2
+        start=2,
     ):
         if not row:
             continue
 
-        backlog = {
+        backlogs.append({
             "backlog_id": (
                 row[0].strip()
                 if len(row) > 0
@@ -349,10 +409,8 @@ def get_backlogs():
                 if len(row) > 7
                 else ""
             ),
-            "sheet_row": sheet_row
-        }
-
-        backlogs.append(backlog)
+            "sheet_row": sheet_row,
+        })
 
     return backlogs
 
@@ -365,28 +423,49 @@ def get_active_backlogs():
     ]
 
 
+def get_backlog_by_id(backlog_id):
+    normalized_id = (
+        backlog_id
+        .strip()
+        .upper()
+    )
+
+    for backlog in get_backlogs():
+        if (
+            backlog["backlog_id"]
+            .upper()
+            == normalized_id
+        ):
+            return backlog
+
+    return None
+
+
 def select_pilot_backlog():
     """
-    Temporary allocation rule.
+    Temporary pre-pilot allocation rule.
 
-    For the pre-pilot template workflow,
-    simply return the first active backlog.
+    Select the first active Backlog.
 
-    Later this function will be replaced by
-    the Job Allocation AI / Work Orchestrator.
+    Later this function becomes the insertion
+    point for the Job Allocation AI.
     """
 
-    active_backlogs = get_active_backlogs()
+    active_backlogs = (
+        get_active_backlogs()
+    )
 
     if not active_backlogs:
         return None
 
     return active_backlogs[0]
 
+
 # =========================================================
 # Assignment Registry
 #
-# Assignments Sheet:
+# Assignments
+#
 # A = Assignment_ID
 # B = Resident_ID
 # C = Backlog_ID
@@ -403,8 +482,9 @@ def get_assignments():
         sheets.spreadsheets()
         .values()
         .get(
-            spreadsheetId=RESIDENT_REGISTRY_SPREADSHEET_ID,
-            range="Assignments!A:G"
+            spreadsheetId=
+                RESIDENT_REGISTRY_SPREADSHEET_ID,
+            range="Assignments!A:G",
         )
         .execute()
     )
@@ -415,7 +495,7 @@ def get_assignments():
 
     for sheet_row, row in enumerate(
         rows[1:],
-        start=2
+        start=2,
     ):
         if not row:
             continue
@@ -423,33 +503,40 @@ def get_assignments():
         assignments.append({
             "assignment_id": (
                 row[0].strip()
-                if len(row) > 0 else ""
+                if len(row) > 0
+                else ""
             ),
             "resident_id": (
                 row[1].strip()
-                if len(row) > 1 else ""
+                if len(row) > 1
+                else ""
             ),
             "backlog_id": (
                 row[2].strip()
-                if len(row) > 2 else ""
+                if len(row) > 2
+                else ""
             ),
             "status": (
                 row[3].strip().upper()
-                if len(row) > 3 else ""
+                if len(row) > 3
+                else ""
             ),
             "assigned_at": (
                 row[4].strip()
-                if len(row) > 4 else ""
+                if len(row) > 4
+                else ""
             ),
             "submitted_at": (
                 row[5].strip()
-                if len(row) > 5 else ""
+                if len(row) > 5
+                else ""
             ),
             "github_url": (
                 row[6].strip()
-                if len(row) > 6 else ""
+                if len(row) > 6
+                else ""
             ),
-            "sheet_row": sheet_row
+            "sheet_row": sheet_row,
         })
 
     return assignments
@@ -459,14 +546,18 @@ def get_active_assignment_for_resident(
     resident_id
 ):
     normalized_id = (
-        resident_id.strip().upper()
+        resident_id
+        .strip()
+        .upper()
     )
 
     for assignment in get_assignments():
         if (
             assignment["resident_id"].upper()
             == normalized_id
-            and assignment["status"] == "ACTIVE"
+            and
+            assignment["status"]
+            == "ACTIVE"
         ):
             return assignment
 
@@ -487,7 +578,7 @@ def generate_assignment_id():
 
         match = re.fullmatch(
             r"ASG(\d+)",
-            assignment_id
+            assignment_id,
         )
 
         if match:
@@ -497,22 +588,18 @@ def generate_assignment_id():
 
             highest_number = max(
                 highest_number,
-                number
+                number,
             )
 
-    next_number = (
-        highest_number + 1
+    return (
+        f"ASG{highest_number + 1:03d}"
     )
-
-    return f"ASG{next_number:03d}"
 
 
 def create_assignment(
     resident_id,
-    backlog_id
+    backlog_id,
 ):
-    # Prevent a second ACTIVE assignment
-    # for the same resident.
     existing = (
         get_active_assignment_for_resident(
             resident_id
@@ -525,7 +612,7 @@ def create_assignment(
             "reason":
                 "active_assignment_already_exists",
             "assignment":
-                existing
+                existing,
         }
 
     sheets = get_sheets_service()
@@ -539,16 +626,6 @@ def create_assignment(
         .isoformat()
     )
 
-    values = [[
-        assignment_id,
-        resident_id,
-        backlog_id,
-        "ACTIVE",
-        assigned_at,
-        "",
-        ""
-    ]]
-
     result = (
         sheets.spreadsheets()
         .values()
@@ -559,8 +636,16 @@ def create_assignment(
             valueInputOption="RAW",
             insertDataOption="INSERT_ROWS",
             body={
-                "values": values
-            }
+                "values": [[
+                    assignment_id,
+                    resident_id,
+                    backlog_id,
+                    "ACTIVE",
+                    assigned_at,
+                    "",
+                    "",
+                ]]
+            },
         )
         .execute()
     )
@@ -582,77 +667,80 @@ def create_assignment(
                 result
                 .get("updates", {})
                 .get("updatedRange")
-            )
+            ),
     }
 
-# =========================================================
-# Resident Registry Writes
-# =========================================================
 
-def update_resident_state(
+def update_assignment_status(
     sheet_row,
-    status=None,
-    counter=None
+    status,
 ):
-    if status is not None:
-        status = (
-            str(status)
-            .strip()
-            .upper()
-        )
-
-        if status not in VALID_RESIDENT_STATUSES:
-            raise ValueError(
-                f"Invalid resident status: {status}"
-            )
+    normalized_status = (
+        str(status)
+        .strip()
+        .upper()
+    )
 
     sheets = get_sheets_service()
-
-    updates = []
-
-    if status is not None:
-        updates.append({
-            "range":
-                f"Approved_Residents!D{sheet_row}",
-            "values": [[status]]
-        })
-
-    if counter is not None:
-        updates.append({
-            "range":
-                f"Approved_Residents!E{sheet_row}",
-            "values": [[counter]]
-        })
-
-    if not updates:
-        return {
-            "updated": False,
-            "updated_cells": 0
-        }
-
-    body = {
-        "valueInputOption": "RAW",
-        "data": updates
-    }
 
     result = (
         sheets.spreadsheets()
         .values()
-        .batchUpdate(
+        .update(
             spreadsheetId=
                 RESIDENT_REGISTRY_SPREADSHEET_ID,
-            body=body
+            range=
+                f"Assignments!D{sheet_row}",
+            valueInputOption="RAW",
+            body={
+                "values": [[
+                    normalized_status
+                ]]
+            },
         )
         .execute()
     )
 
     return {
         "updated": True,
+        "status":
+            normalized_status,
         "updated_cells":
             result.get(
-                "totalUpdatedCells",
-                0
-            )
+                "updatedCells",
+                0,
+            ),
+    }
+
+
+# =========================================================
+# Current Work Context
+# =========================================================
+
+def get_current_work_context(
+    resident_id
+):
+    assignment = (
+        get_active_assignment_for_resident(
+            resident_id
+        )
+    )
+
+    if assignment is None:
+        return None
+
+    backlog = get_backlog_by_id(
+        assignment["backlog_id"]
+    )
+
+    if backlog is None:
+        return None
+
+    return {
+        "assignment":
+            assignment,
+        "backlog":
+            backlog,
     }
 
 
@@ -663,7 +751,7 @@ def update_resident_state(
 def send_email(
     recipient,
     subject,
-    body
+    body,
 ):
     gmail = get_gmail_service()
 
@@ -681,23 +769,93 @@ def send_email(
         .decode()
     )
 
-    sent_message = (
+    return (
         gmail.users()
         .messages()
         .send(
             userId="me",
             body={
                 "raw": encoded_message
-            }
+            },
         )
         .execute()
     )
 
-    return sent_message
+
+# =========================================================
+# Threaded Reply Helper
+# =========================================================
+
+def send_threaded_reply(
+    message,
+    body,
+):
+    gmail = get_gmail_service()
+
+    original_subject = (
+        message["subject"]
+        if message["subject"]
+        else "The Tech Residency Program"
+    )
+
+    if (
+        original_subject
+        .lower()
+        .startswith("re:")
+    ):
+        reply_subject = (
+            original_subject
+        )
+    else:
+        reply_subject = (
+            f"Re: {original_subject}"
+        )
+
+    email_message = EmailMessage()
+
+    email_message["To"] = (
+        message["sender_email"]
+    )
+
+    email_message["Subject"] = (
+        reply_subject
+    )
+
+    if message["rfc_message_id"]:
+        email_message["In-Reply-To"] = (
+            message["rfc_message_id"]
+        )
+
+        email_message["References"] = (
+            message["rfc_message_id"]
+        )
+
+    email_message.set_content(body)
+
+    encoded_message = (
+        base64.urlsafe_b64encode(
+            email_message.as_bytes()
+        )
+        .decode()
+    )
+
+    return (
+        gmail.users()
+        .messages()
+        .send(
+            userId="me",
+            body={
+                "raw":
+                    encoded_message,
+                "threadId":
+                    message["thread_id"],
+            },
+        )
+        .execute()
+    )
 
 
 # =========================================================
-# Welcome Template
 # JOINED -> PENDING
 # =========================================================
 
@@ -737,16 +895,13 @@ The Tech Residency Program"""
 
     return {
         "subject": subject,
-        "body": body
+        "body": body,
     }
 
 
-# =========================================================
-# First Residency Workflow
-# JOINED -> Welcome Email -> PENDING
-# =========================================================
-
-def process_joined_resident(resident):
+def process_joined_resident(
+    resident
+):
     if resident["status"] != "JOINED":
         return {
             "resident_id":
@@ -754,7 +909,7 @@ def process_joined_resident(resident):
             "action":
                 "skipped",
             "reason":
-                "resident_not_joined"
+                "resident_not_joined",
         }
 
     if not resident["email"]:
@@ -764,20 +919,22 @@ def process_joined_resident(resident):
             "action":
                 "failed",
             "reason":
-                "resident_email_missing"
+                "resident_email_missing",
         }
 
-    welcome = build_welcome_message(
-        resident
+    welcome = (
+        build_welcome_message(
+            resident
+        )
     )
 
-    # IMPORTANT:
-    # Send first.
-    # Change status only after Gmail confirms success.
     sent_message = send_email(
-        recipient=resident["email"],
-        subject=welcome["subject"],
-        body=welcome["body"]
+        recipient=
+            resident["email"],
+        subject=
+            welcome["subject"],
+        body=
+            welcome["body"],
     )
 
     sent_message_id = (
@@ -791,12 +948,15 @@ def process_joined_resident(resident):
             "action":
                 "failed",
             "reason":
-                "gmail_send_not_confirmed"
+                "gmail_send_not_confirmed",
         }
 
-    update_result = update_resident_state(
-        sheet_row=resident["sheet_row"],
-        status="PENDING"
+    update_result = (
+        update_resident_state(
+            sheet_row=
+                resident["sheet_row"],
+            status="PENDING",
+        )
     )
 
     return {
@@ -813,7 +973,7 @@ def process_joined_resident(resident):
         "new_status":
             "PENDING",
         "sheet_update":
-            update_result
+            update_result,
     }
 
 
@@ -830,8 +990,10 @@ def process_all_joined_residents():
 
     for resident in joined_residents:
         try:
-            result = process_joined_resident(
-                resident
+            result = (
+                process_joined_resident(
+                    resident
+                )
             )
 
         except Exception as error:
@@ -841,7 +1003,7 @@ def process_all_joined_residents():
                 "action":
                     "failed",
                 "error":
-                    str(error)
+                    str(error),
             }
 
         results.append(result)
@@ -850,16 +1012,99 @@ def process_all_joined_residents():
         "joined_resident_count":
             len(joined_residents),
         "results":
-            results
+            results,
     }
 
+
 # =========================================================
-# Backlog Assignment Template
+# PENDING -> READY
+# =========================================================
+
+def process_pending_reply(
+    resident,
+    message,
+):
+    first_name = (
+        resident["name"]
+        .strip()
+        .split()[0]
+        if resident["name"].strip()
+        else "Resident"
+    )
+
+    body = f"""Hi {first_name},
+
+Thanks for sharing your details. Your onboarding is now complete.
+
+You're now ready to begin your residency with The Tech Residency Program.
+
+You'll be working on a real-world-style project that has been divided into smaller engineering Backlogs. Each Backlog represents a specific piece of work with clear requirements, expected outputs, and completion conditions.
+
+You don't need to understand the entire project before starting. You'll gradually become familiar with the system as you work through different Backlogs.
+
+Your work will be maintained in GitHub, and I'll periodically check in with you through our Scrum emails while you're working on an assignment.
+
+Your first Backlog will be assigned shortly.
+
+Welcome to the team.
+
+Regards,
+John Doe
+Tech Lead
+The Tech Residency Program"""
+
+    sent_message = (
+        send_threaded_reply(
+            message=message,
+            body=body,
+        )
+    )
+
+    sent_message_id = (
+        sent_message.get("id")
+    )
+
+    if not sent_message_id:
+        return {
+            "resident_id":
+                resident["resident_id"],
+            "action":
+                "failed",
+            "reason":
+                "onboarding_reply_not_confirmed",
+        }
+
+    update_result = (
+        update_resident_state(
+            sheet_row=
+                resident["sheet_row"],
+            status="READY",
+        )
+    )
+
+    return {
+        "resident_id":
+            resident["resident_id"],
+        "action":
+            "onboarding_completed",
+        "sent_message_id":
+            sent_message_id,
+        "old_status":
+            "PENDING",
+        "new_status":
+            "READY",
+        "sheet_update":
+            update_result,
+    }
+
+
+# =========================================================
+# READY -> ACTIVE / Counter 3
 # =========================================================
 
 def build_backlog_assignment_message(
     resident,
-    backlog
+    backlog,
 ):
     first_name = (
         resident["name"]
@@ -909,7 +1154,7 @@ You don't need to wait until completion to contact me. If you're blocked, unsure
 
 I'll also check in periodically while the Backlog is active.
 
-Good luck with your first assignment.
+Good luck with your assignment.
 
 Regards,
 John Doe
@@ -918,17 +1163,13 @@ The Tech Residency Program"""
 
     return {
         "subject": subject,
-        "body": body
+        "body": body,
     }
 
 
-# =========================================================
-# READY -> Backlog Assignment -> ACTIVE / Counter 3
-# =========================================================
-
 def process_ready_resident(
     resident,
-    backlog
+    backlog,
 ):
     if resident["status"] != "READY":
         return {
@@ -937,7 +1178,7 @@ def process_ready_resident(
             "action":
                 "skipped",
             "reason":
-                "resident_not_ready"
+                "resident_not_ready",
         }
 
     if not resident["email"]:
@@ -947,7 +1188,7 @@ def process_ready_resident(
             "action":
                 "failed",
             "reason":
-                "resident_email_missing"
+                "resident_email_missing",
         }
 
     if backlog is None:
@@ -957,12 +1198,9 @@ def process_ready_resident(
             "action":
                 "failed",
             "reason":
-                "no_active_backlog_available"
+                "no_active_backlog_available",
         }
 
-    # Safety check:
-    # A READY resident should not already
-    # have an ACTIVE assignment.
     existing_assignment = (
         get_active_assignment_for_resident(
             resident["resident_id"]
@@ -978,26 +1216,24 @@ def process_ready_resident(
             "reason":
                 "active_assignment_already_exists",
             "assignment":
-                existing_assignment
+                existing_assignment,
         }
 
     assignment_message = (
         build_backlog_assignment_message(
             resident=resident,
-            backlog=backlog
+            backlog=backlog,
         )
     )
 
-    # -----------------------------------------------------
-    # 1. Send assignment email first.
-    # -----------------------------------------------------
-
+    # 1. Send assignment.
     sent_message = send_email(
-        recipient=resident["email"],
+        recipient=
+            resident["email"],
         subject=
             assignment_message["subject"],
         body=
-            assignment_message["body"]
+            assignment_message["body"],
     )
 
     sent_message_id = (
@@ -1011,19 +1247,16 @@ def process_ready_resident(
             "action":
                 "failed",
             "reason":
-                "assignment_email_not_confirmed"
+                "assignment_email_not_confirmed",
         }
 
-    # -----------------------------------------------------
-    # 2. Persist the assignment.
-    # -----------------------------------------------------
-
+    # 2. Persist assignment.
     assignment_result = (
         create_assignment(
             resident_id=
                 resident["resident_id"],
             backlog_id=
-                backlog["backlog_id"]
+                backlog["backlog_id"],
         )
     )
 
@@ -1038,20 +1271,16 @@ def process_ready_resident(
             "sent_message_id":
                 sent_message_id,
             "assignment_result":
-                assignment_result
+                assignment_result,
         }
 
-    # -----------------------------------------------------
-    # 3. Only after persistence succeeds,
-    #    move resident to ACTIVE / 3.
-    # -----------------------------------------------------
-
+    # 3. Activate resident.
     update_result = (
         update_resident_state(
             sheet_row=
                 resident["sheet_row"],
             status="ACTIVE",
-            counter=3
+            counter=3,
         )
     )
 
@@ -1081,7 +1310,7 @@ def process_ready_resident(
         "assignment_record":
             assignment_result,
         "sheet_update":
-            update_result
+            update_result,
     }
 
 
@@ -1094,16 +1323,19 @@ def process_all_ready_residents():
         if resident["status"] == "READY"
     ]
 
-    # Temporary allocation mechanism.
-    backlog = select_pilot_backlog()
+    backlog = (
+        select_pilot_backlog()
+    )
 
     results = []
 
     for resident in ready_residents:
         try:
-            result = process_ready_resident(
-                resident=resident,
-                backlog=backlog
+            result = (
+                process_ready_resident(
+                    resident=resident,
+                    backlog=backlog,
+                )
             )
 
         except Exception as error:
@@ -1113,7 +1345,7 @@ def process_all_ready_residents():
                 "action":
                     "failed",
                 "error":
-                    str(error)
+                    str(error),
             }
 
         results.append(result)
@@ -1128,17 +1360,427 @@ def process_all_ready_residents():
                 else None
             ),
         "results":
-            results
+            results,
     }
 
 
+# =========================================================
+# ACTIVE Scheduled Scrum Templates
+# =========================================================
+
+def build_scrum_reminder_message(
+    resident,
+    backlog,
+):
+    first_name = (
+        resident["name"]
+        .strip()
+        .split()[0]
+        if resident["name"].strip()
+        else "Resident"
+    )
+
+    subject = (
+        f"Scrum Check-in — "
+        f"{backlog['backlog_id']}"
+    )
+
+    body = f"""Hi {first_name},
+
+Just checking in on your current Backlog:
+
+{backlog['backlog_id']} — {backlog['title']}
+
+When you get a moment, reply with a short update on:
+
+- What you've completed so far
+- What you're currently working on
+- Anything blocking your progress
+
+A brief update is enough. If you're stuck somewhere, include the issue and I'll help you work through it.
+
+Regards,
+John Doe
+Scrum Master
+The Tech Residency Program"""
+
+    return {
+        "subject": subject,
+        "body": body,
+    }
+
+
+def build_scrum_warning_message(
+    resident,
+    backlog,
+):
+    first_name = (
+        resident["name"]
+        .strip()
+        .split()[0]
+        if resident["name"].strip()
+        else "Resident"
+    )
+
+    subject = (
+        f"Progress Update Required — "
+        f"{backlog['backlog_id']}"
+    )
+
+    body = f"""Hi {first_name},
+
+I haven't received a recent progress update for your current Backlog:
+
+{backlog['backlog_id']} — {backlog['title']}
+
+Please reply with a quick update, even if you haven't been able to make progress.
+
+If you're facing a blocker, workload issue, or need clarification, let me know. The purpose of the check-in is to understand where things stand and help you move forward.
+
+Please don't leave the Backlog without an update for an extended period.
+
+Regards,
+John Doe
+Scrum Master
+The Tech Residency Program"""
+
+    return {
+        "subject": subject,
+        "body": body,
+    }
+
+
+# =========================================================
+# ACTIVE Scheduled Scrum Lifecycle
+#
+# Counter 3,2,1  -> normal Scrum reminder
+# Counter 0..-3  -> warning
+# Counter < -3   -> INACTIVE / discard assignment
+# =========================================================
+
+def process_scheduled_active_resident(
+    resident
+):
+    counter = resident["counter"]
+
+    if counter is None:
+        counter = 3
+
+    work_context = (
+        get_current_work_context(
+            resident["resident_id"]
+        )
+    )
+
+    if work_context is None:
+        return {
+            "resident_id":
+                resident["resident_id"],
+            "action":
+                "failed",
+            "reason":
+                "active_assignment_not_found",
+        }
+
+    assignment = (
+        work_context["assignment"]
+    )
+
+    backlog = (
+        work_context["backlog"]
+    )
+
+    # -----------------------------------------------------
+    # Counter already below -3.
+    # Discard Backlog and make resident INACTIVE.
+    # -----------------------------------------------------
+
+    if counter < -3:
+        assignment_update = (
+            update_assignment_status(
+                sheet_row=
+                    assignment["sheet_row"],
+                status="DISCARDED",
+            )
+        )
+
+        resident_update = (
+            update_resident_state(
+                sheet_row=
+                    resident["sheet_row"],
+                status="INACTIVE",
+                counter=0,
+            )
+        )
+
+        return {
+            "resident_id":
+                resident["resident_id"],
+            "assignment_id":
+                assignment["assignment_id"],
+            "backlog_id":
+                backlog["backlog_id"],
+            "action":
+                "resident_moved_inactive",
+            "old_status":
+                "ACTIVE",
+            "new_status":
+                "INACTIVE",
+            "old_counter":
+                counter,
+            "new_counter":
+                0,
+            "assignment_status":
+                "DISCARDED",
+            "assignment_update":
+                assignment_update,
+            "resident_update":
+                resident_update,
+        }
+
+    # -----------------------------------------------------
+    # Counter 1 to 3.
+    # Normal Scrum reminder.
+    # -----------------------------------------------------
+
+    if counter > 0:
+        message = (
+            build_scrum_reminder_message(
+                resident=resident,
+                backlog=backlog,
+            )
+        )
+
+        message_type = (
+            "scrum_reminder"
+        )
+
+    # -----------------------------------------------------
+    # Counter 0 to -3.
+    # Warning.
+    # -----------------------------------------------------
+
+    else:
+        message = (
+            build_scrum_warning_message(
+                resident=resident,
+                backlog=backlog,
+            )
+        )
+
+        message_type = (
+            "scrum_warning"
+        )
+
+    sent_message = send_email(
+        recipient=
+            resident["email"],
+        subject=
+            message["subject"],
+        body=
+            message["body"],
+    )
+
+    sent_message_id = (
+        sent_message.get("id")
+    )
+
+    if not sent_message_id:
+        return {
+            "resident_id":
+                resident["resident_id"],
+            "action":
+                "failed",
+            "reason":
+                "scrum_email_not_confirmed",
+        }
+
+    new_counter = (
+        counter - 1
+    )
+
+    update_result = (
+        update_resident_state(
+            sheet_row=
+                resident["sheet_row"],
+            counter=new_counter,
+        )
+    )
+
+    return {
+        "resident_id":
+            resident["resident_id"],
+        "assignment_id":
+            assignment["assignment_id"],
+        "backlog_id":
+            backlog["backlog_id"],
+        "action":
+            message_type,
+        "sent_message_id":
+            sent_message_id,
+        "old_counter":
+            counter,
+        "new_counter":
+            new_counter,
+        "sheet_update":
+            update_result,
+    }
+
+
+def process_all_active_residents():
+    residents = get_residents()
+
+    active_residents = [
+        resident
+        for resident in residents
+        if resident["status"] == "ACTIVE"
+    ]
+
+    results = []
+
+    for resident in active_residents:
+        try:
+            result = (
+                process_scheduled_active_resident(
+                    resident
+                )
+            )
+
+        except Exception as error:
+            result = {
+                "resident_id":
+                    resident["resident_id"],
+                "action":
+                    "failed",
+                "error":
+                    str(error),
+            }
+
+        results.append(result)
+
+    return {
+        "active_resident_count":
+            len(active_residents),
+        "results":
+            results,
+    }
+
+
+# =========================================================
+# ACTIVE Resident Reply
+#
+# Static Scrum response for now.
+#
+# THIS is the future Scrum AI insertion point.
+# =========================================================
+
+def process_active_reply(
+    resident,
+    message,
+):
+    work_context = (
+        get_current_work_context(
+            resident["resident_id"]
+        )
+    )
+
+    if work_context is None:
+        return {
+            "resident_id":
+                resident["resident_id"],
+            "action":
+                "failed",
+            "reason":
+                "active_assignment_not_found",
+        }
+
+    assignment = (
+        work_context["assignment"]
+    )
+
+    backlog = (
+        work_context["backlog"]
+    )
+
+    first_name = (
+        resident["name"]
+        .strip()
+        .split()[0]
+        if resident["name"].strip()
+        else "Resident"
+    )
+
+    body = f"""Hi {first_name},
+
+Thanks for the update on {backlog['backlog_id']} — {backlog['title']}.
+
+I've noted your progress. Please continue with the Backlog and keep committing your work regularly to GitHub.
+
+If you run into a blocker or need clarification, reply to this thread with the details and we'll work through it.
+
+When the Backlog is complete, send the GitHub repository link in your reply for submission.
+
+Regards,
+John Doe
+Scrum Master
+The Tech Residency Program"""
+
+    sent_message = (
+        send_threaded_reply(
+            message=message,
+            body=body,
+        )
+    )
+
+    sent_message_id = (
+        sent_message.get("id")
+    )
+
+    if not sent_message_id:
+        return {
+            "resident_id":
+                resident["resident_id"],
+            "action":
+                "failed",
+            "reason":
+                "scrum_reply_not_confirmed",
+        }
+
+    update_result = (
+        update_resident_state(
+            sheet_row=
+                resident["sheet_row"],
+            counter=3,
+        )
+    )
+
+    return {
+        "resident_id":
+            resident["resident_id"],
+        "assignment_id":
+            assignment["assignment_id"],
+        "backlog_id":
+            backlog["backlog_id"],
+        "action":
+            "scrum_reply_sent",
+        "sent_message_id":
+            sent_message_id,
+        "status":
+            "ACTIVE",
+        "counter_reset_to":
+            3,
+        "sheet_update":
+            update_result,
+    }
 
 
 # =========================================================
 # Gmail Metadata Helpers
 # =========================================================
 
-def get_message_metadata(message_id):
+def get_message_metadata(
+    message_id
+):
     gmail = get_gmail_service()
 
     message = (
@@ -1153,8 +1795,8 @@ def get_message_metadata(message_id):
                 "To",
                 "Subject",
                 "Date",
-                "Message-ID"
-            ]
+                "Message-ID",
+            ],
         )
         .execute()
     )
@@ -1169,8 +1811,13 @@ def get_message_metadata(message_id):
         )
     }
 
-    sender_name, sender_email = parseaddr(
-        headers.get("from", "")
+    sender_name, sender_email = (
+        parseaddr(
+            headers.get(
+                "from",
+                "",
+            )
+        )
     )
 
     return {
@@ -1189,7 +1836,10 @@ def get_message_metadata(message_id):
         "date":
             headers.get("date", ""),
         "rfc_message_id":
-            headers.get("message-id", "")
+            headers.get(
+                "message-id",
+                "",
+            ),
     }
 
 
@@ -1214,14 +1864,16 @@ def decode_body_data(data):
 
     return decoded_bytes.decode(
         "utf-8",
-        errors="replace"
+        errors="replace",
     )
 
 
-def extract_plain_text_from_payload(payload):
+def extract_plain_text_from_payload(
+    payload
+):
     mime_type = payload.get(
         "mimeType",
-        ""
+        "",
     )
 
     body_data = (
@@ -1243,10 +1895,10 @@ def extract_plain_text_from_payload(payload):
 
     parts = payload.get(
         "parts",
-        []
+        [],
     )
 
-    # Prefer text/plain.
+    # Prefer plain text.
     for part in parts:
         if (
             part.get("mimeType")
@@ -1261,7 +1913,7 @@ def extract_plain_text_from_payload(payload):
             if text:
                 return text
 
-    # Search nested multipart structures.
+    # Search nested multipart content.
     for part in parts:
         if part.get("parts"):
             text = (
@@ -1287,17 +1939,15 @@ def extract_plain_text_from_payload(payload):
         text = re.sub(
             r"<[^>]+>",
             " ",
-            html_content
+            html_content,
         )
 
-        text = html.unescape(
-            text
-        )
+        text = html.unescape(text)
 
         text = re.sub(
             r"\s+",
             " ",
-            text
+            text,
         )
 
         return text.strip()
@@ -1319,7 +1969,9 @@ def extract_plain_text_from_payload(payload):
     return ""
 
 
-def get_full_authorized_message(message_id):
+def get_full_authorized_message(
+    message_id
+):
     gmail = get_gmail_service()
 
     message = (
@@ -1328,14 +1980,14 @@ def get_full_authorized_message(message_id):
         .get(
             userId="me",
             id=message_id,
-            format="full"
+            format="full",
         )
         .execute()
     )
 
     payload = message.get(
         "payload",
-        {}
+        {},
     )
 
     body = (
@@ -1350,18 +2002,16 @@ def get_full_authorized_message(message_id):
         "snippet":
             message.get(
                 "snippet",
-                ""
-            )
+                "",
+            ),
     }
 
 
 # =========================================================
-# Fixed Decline Reply
+# Unauthorized Sender Reply
 # =========================================================
 
 def send_decline_reply(message):
-    gmail = get_gmail_service()
-
     original_subject = (
         message["subject"]
     )
@@ -1382,170 +2032,21 @@ def send_decline_reply(message):
     body = (
         "Thank you for contacting "
         "The Tech Residency Program.\n\n"
-
         "This email address is not currently "
         "authorized to interact with the Residency "
         "system. If you believe this is an error, "
         "please contact the Residency Program "
         "coordinator using your registered email "
         "address.\n\n"
-
         "Regards,\n"
         "John Doe\n"
         "Tech Lead\n"
         "The Tech Residency Program"
     )
 
-    email_message = EmailMessage()
-
-    email_message["To"] = (
-        message["sender_email"]
-    )
-
-    email_message["Subject"] = (
-        reply_subject
-    )
-
-    if message["rfc_message_id"]:
-        email_message["In-Reply-To"] = (
-            message["rfc_message_id"]
-        )
-
-        email_message["References"] = (
-            message["rfc_message_id"]
-        )
-
-    email_message.set_content(
-        body
-    )
-
-    encoded_message = (
-        base64.urlsafe_b64encode(
-            email_message.as_bytes()
-        )
-        .decode()
-    )
-
-    sent_message = (
-        gmail.users()
-        .messages()
-        .send(
-            userId="me",
-            body={
-                "raw":
-                    encoded_message,
-                "threadId":
-                    message["thread_id"]
-            }
-        )
-        .execute()
-    )
-
-    return sent_message
-
-
-# =========================================================
-# Gmail History
-# =========================================================
-
-def get_new_message_ids(
-    start_history_id
-):
+    # Use threaded helper while preserving
+    # the decline-specific subject.
     gmail = get_gmail_service()
-
-    message_ids = set()
-    page_token = None
-
-    while True:
-        request = (
-            gmail.users()
-            .history()
-            .list(
-                userId="me",
-                startHistoryId=str(
-                    start_history_id
-                ),
-                historyTypes=[
-                    "messageAdded"
-                ],
-                labelId="INBOX",
-                pageToken=page_token
-            )
-        )
-
-        result = request.execute()
-
-        for history_record in (
-            result.get(
-                "history",
-                []
-            )
-        ):
-            for added in (
-                history_record.get(
-                    "messagesAdded",
-                    []
-                )
-            ):
-                message = (
-                    added.get(
-                        "message",
-                        {}
-                    )
-                )
-
-                message_id = (
-                    message.get("id")
-                )
-
-                label_ids = (
-                    message.get(
-                        "labelIds",
-                        []
-                    )
-                )
-
-                if (
-                    message_id
-                    and "INBOX" in label_ids
-                ):
-                    message_ids.add(
-                        message_id
-                    )
-
-        page_token = (
-            result.get(
-                "nextPageToken"
-            )
-        )
-
-        if not page_token:
-            break
-
-    return list(
-        message_ids
-    )
-
-# =========================================================
-# Threaded Reply Helper
-# =========================================================
-
-def send_threaded_reply(
-    message,
-    body
-):
-    gmail = get_gmail_service()
-
-    original_subject = (
-        message["subject"]
-        if message["subject"]
-        else "The Tech Residency Program"
-    )
-
-    if original_subject.lower().startswith("re:"):
-        reply_subject = original_subject
-    else:
-        reply_subject = f"Re: {original_subject}"
 
     email_message = EmailMessage()
 
@@ -1575,105 +2076,109 @@ def send_threaded_reply(
         .decode()
     )
 
-    sent_message = (
+    return (
         gmail.users()
         .messages()
         .send(
             userId="me",
             body={
-                "raw": encoded_message,
-                "threadId": message["thread_id"]
-            }
+                "raw":
+                    encoded_message,
+                "threadId":
+                    message["thread_id"],
+            },
         )
         .execute()
     )
 
-    return sent_message
-
 
 # =========================================================
-# PENDING -> READY
-# Static Onboarding Completion
+# Gmail History
 # =========================================================
 
-def process_pending_reply(
-    resident,
-    message
+def get_new_message_ids(
+    start_history_id
 ):
-    first_name = (
-        resident["name"]
-        .strip()
-        .split()[0]
-        if resident["name"].strip()
-        else "Resident"
-    )
+    gmail = get_gmail_service()
 
-    body = f"""Hi {first_name},
+    message_ids = set()
 
-Thanks for sharing your details. Your onboarding is now complete.
+    page_token = None
 
-You're now ready to begin your residency with The Tech Residency Program.
+    while True:
+        request = (
+            gmail.users()
+            .history()
+            .list(
+                userId="me",
+                startHistoryId=str(
+                    start_history_id
+                ),
+                historyTypes=[
+                    "messageAdded"
+                ],
+                labelId="INBOX",
+                pageToken=page_token,
+            )
+        )
 
-You'll be working on a real-world-style project that has been divided into smaller engineering Backlogs. Each Backlog represents a specific piece of work with clear requirements, expected outputs, and completion conditions.
+        result = request.execute()
 
-You don't need to understand the entire project before starting. You'll gradually become familiar with the system as you work through different Backlogs.
+        for history_record in (
+            result.get(
+                "history",
+                [],
+            )
+        ):
+            for added in (
+                history_record.get(
+                    "messagesAdded",
+                    [],
+                )
+            ):
+                message = (
+                    added.get(
+                        "message",
+                        {},
+                    )
+                )
 
-Your work will be maintained in GitHub, and I'll periodically check in with you through our Scrum emails while you're working on an assignment.
+                message_id = (
+                    message.get("id")
+                )
 
-Your first Backlog will be assigned shortly.
+                label_ids = (
+                    message.get(
+                        "labelIds",
+                        [],
+                    )
+                )
 
-Welcome to the team.
+                if (
+                    message_id
+                    and
+                    "INBOX" in label_ids
+                ):
+                    message_ids.add(
+                        message_id
+                    )
 
-Regards,
-John Doe
-Tech Lead
-The Tech Residency Program"""
+        page_token = (
+            result.get(
+                "nextPageToken"
+            )
+        )
 
-    # Send response first.
-    sent_message = send_threaded_reply(
-        message=message,
-        body=body
-    )
+        if not page_token:
+            break
 
-    sent_message_id = (
-        sent_message.get("id")
-    )
-
-    if not sent_message_id:
-        return {
-            "resident_id":
-                resident["resident_id"],
-            "action":
-                "failed",
-            "reason":
-                "onboarding_reply_not_confirmed"
-        }
-
-    # Only move to READY after
-    # successful Gmail send.
-    update_result = update_resident_state(
-        sheet_row=resident["sheet_row"],
-        status="READY"
-    )
-
-    return {
-        "resident_id":
-            resident["resident_id"],
-        "action":
-            "onboarding_completed",
-        "sent_message_id":
-            sent_message_id,
-        "old_status":
-            "PENDING",
-        "new_status":
-            "READY",
-        "sheet_update":
-            update_result
-    }
+    return list(message_ids)
 
 
 # =========================================================
 # Process Exact Gmail Message
+#
+# This is the inbound state router.
 # =========================================================
 
 def process_message(message_id):
@@ -1687,7 +2192,7 @@ def process_message(message_id):
             "message_id":
                 message_id,
             "action":
-                "duplicate_ignored"
+                "duplicate_ignored",
         }
 
     message = (
@@ -1708,7 +2213,7 @@ def process_message(message_id):
             "message_id":
                 message_id,
             "action":
-                "non_inbox_ignored"
+                "non_inbox_ignored",
         }
 
     authorization = (
@@ -1718,8 +2223,8 @@ def process_message(message_id):
     )
 
     # -----------------------------------------------------
-    # Unknown / unregistered email.
-    # Do NOT retrieve body.
+    # Unknown sender.
+    # Do not retrieve body.
     # -----------------------------------------------------
 
     if not authorization["authorized"]:
@@ -1741,12 +2246,12 @@ def process_message(message_id):
             "action":
                 "decline_sent",
             "sent_message_id":
-                sent_message.get("id")
+                sent_message.get("id"),
         }
 
     # -----------------------------------------------------
     # Registered resident.
-    # Only now retrieve full content.
+    # Retrieve message body.
     # -----------------------------------------------------
 
     full_message = (
@@ -1781,36 +2286,35 @@ def process_message(message_id):
         "body":
             full_message["body"],
         "snippet":
-            full_message["snippet"]
+            full_message["snippet"],
     }
 
-        # -----------------------------------------------------
-    # Residency State Routing
+    resident = {
+        "resident_id":
+            authorization["resident_id"],
+        "name":
+            authorization["name"],
+        "email":
+            authorization["email"],
+        "status":
+            authorization["status"],
+        "counter":
+            authorization["counter"],
+        "mentor":
+            authorization["mentor"],
+        "sheet_row":
+            authorization["sheet_row"],
+    }
+
+    # -----------------------------------------------------
+    # PENDING -> READY
     # -----------------------------------------------------
 
     if authorization["status"] == "PENDING":
-
-        resident = {
-            "resident_id":
-                authorization["resident_id"],
-            "name":
-                authorization["name"],
-            "email":
-                authorization["email"],
-            "status":
-                authorization["status"],
-            "counter":
-                authorization["counter"],
-            "mentor":
-                authorization["mentor"],
-            "sheet_row":
-                authorization["sheet_row"]
-        }
-
         onboarding_result = (
             process_pending_reply(
                 resident=resident,
-                message=message
+                message=message,
             )
         )
 
@@ -1830,8 +2334,47 @@ def process_message(message_id):
             "action":
                 "pending_reply_processed",
             "onboarding":
-                onboarding_result
+                onboarding_result,
         }
+
+    # -----------------------------------------------------
+    # ACTIVE -> Scrum interaction
+    # -----------------------------------------------------
+
+    if authorization["status"] == "ACTIVE":
+        scrum_result = (
+            process_active_reply(
+                resident=resident,
+                message=message,
+            )
+        )
+
+        processed_message_ids.add(
+            message_id
+        )
+
+        return {
+            "message_id":
+                message_id,
+            "sender_email":
+                message["sender_email"],
+            "resident_id":
+                authorization["resident_id"],
+            "resident_name":
+                authorization["name"],
+            "action":
+                "active_reply_processed",
+            "scrum":
+                scrum_result,
+        }
+
+    # -----------------------------------------------------
+    # Other registered statuses.
+    #
+    # Later:
+    # READY, SUBMITTED, INACTIVE, DEAD
+    # receive their own inbound routing rules.
+    # -----------------------------------------------------
 
     processed_message_ids.add(
         message_id
@@ -1851,7 +2394,7 @@ def process_message(message_id):
         "resident_counter":
             authorization["counter"],
         "action":
-            "registered_resident_email_extracted"
+            "registered_resident_email_extracted",
     }
 
 
@@ -1865,7 +2408,7 @@ def home():
         "service":
             "Residency Pre-Pilot Backend",
         "status":
-            "running"
+            "running",
     }
 
 
@@ -1901,8 +2444,7 @@ def google_auth():
     )
 
     state_data = {
-        "cv":
-            code_verifier
+        "cv": code_verifier
     }
 
     state = (
@@ -1945,7 +2487,7 @@ def oauth_callback(
         return {
             "status": "error",
             "message":
-                "OAuth state is missing."
+                "OAuth state is missing.",
         }
 
     try:
@@ -1969,7 +2511,7 @@ def oauth_callback(
         return {
             "status": "error",
             "message":
-                "Invalid OAuth state."
+                "Invalid OAuth state.",
         }
 
     flow = create_flow()
@@ -1984,7 +2526,9 @@ def oauth_callback(
         )
     )
 
-    credentials = flow.credentials
+    credentials = (
+        flow.credentials
+    )
 
     return {
         "status":
@@ -1995,12 +2539,12 @@ def oauth_callback(
             ),
         "message":
             "Google authorization "
-            "completed successfully."
+            "completed successfully.",
     }
 
 
 # =========================================================
-# Connectivity Tests
+# Connectivity / Development Endpoints
 # =========================================================
 
 @app.get("/test/gmail")
@@ -2029,7 +2573,7 @@ def test_gmail():
         "threads_total":
             profile.get(
                 "threadsTotal"
-            )
+            ),
     }
 
 
@@ -2043,81 +2587,12 @@ def test_residents():
         "resident_count":
             len(residents),
         "residents":
-            residents
-    }
-
-
-# =========================================================
-# Temporary State-Write Test
-# =========================================================
-
-@app.get(
-    "/test/update-resident-state/{resident_id}"
-)
-def test_update_resident_state(
-    resident_id: str,
-    status: str = None,
-    counter: int = None
-):
-    resident = get_resident_by_id(
-        resident_id
-    )
-
-    if resident is None:
-        return {
-            "status":
-                "resident_not_found",
-            "resident_id":
-                resident_id
-        }
-
-    if (
-        status is None
-        and counter is None
-    ):
-        return {
-            "status":
-                "no_change_requested",
-            "resident":
-                resident,
-            "message":
-                "Provide status and/or counter "
-                "as query parameters."
-        }
-
-    try:
-        result = (
-            update_resident_state(
-                sheet_row=
-                    resident["sheet_row"],
-                status=status,
-                counter=counter
-            )
-        )
-
-    except ValueError as error:
-        return {
-            "status":
-                "invalid_request",
-            "message":
-                str(error)
-        }
-
-    return {
-        "status":
-            "resident_state_updated",
-        "resident_id":
-            resident_id,
-        "result":
-            result
+            residents,
     }
 
 
 # =========================================================
 # TEST: Process JOINED Residents
-#
-# For development only.
-# Later this function will be triggered by the orchestrator.
 # =========================================================
 
 @app.get("/test/process-joined")
@@ -2130,7 +2605,7 @@ def test_process_joined():
         return {
             "status":
                 "joined_processing_complete",
-            **result
+            **result,
         }
 
     except HttpError as error:
@@ -2138,7 +2613,7 @@ def test_process_joined():
             "status":
                 "google_api_error",
             "error":
-                str(error)
+                str(error),
         }
 
     except Exception as error:
@@ -2146,7 +2621,77 @@ def test_process_joined():
             "status":
                 "processing_error",
             "error":
-                str(error)
+                str(error),
+        }
+
+
+# =========================================================
+# TEST: Process READY Residents
+# =========================================================
+
+@app.get("/test/process-ready")
+def test_process_ready():
+    try:
+        result = (
+            process_all_ready_residents()
+        )
+
+        return {
+            "status":
+                "ready_processing_complete",
+            **result,
+        }
+
+    except HttpError as error:
+        return {
+            "status":
+                "google_api_error",
+            "error":
+                str(error),
+        }
+
+    except Exception as error:
+        return {
+            "status":
+                "processing_error",
+            "error":
+                str(error),
+        }
+
+
+# =========================================================
+# TEST: Scheduled ACTIVE Scrum Run
+#
+# Later this is scheduled automatically for 10:30 AM.
+# =========================================================
+
+@app.get("/test/process-active")
+def test_process_active():
+    try:
+        result = (
+            process_all_active_residents()
+        )
+
+        return {
+            "status":
+                "active_processing_complete",
+            **result,
+        }
+
+    except HttpError as error:
+        return {
+            "status":
+                "google_api_error",
+            "error":
+                str(error),
+        }
+
+    except Exception as error:
+        return {
+            "status":
+                "processing_error",
+            "error":
+                str(error),
         }
 
 
@@ -2169,14 +2714,14 @@ async def gmail_pubsub_webhook(
         pubsub_message = (
             payload.get(
                 "message",
-                {}
+                {},
             )
         )
 
         encoded_data = (
             pubsub_message.get(
                 "data",
-                ""
+                "",
             )
         )
 
@@ -2227,7 +2772,7 @@ async def gmail_pubsub_webhook(
             "previous_history_id":
                 last_history_id,
             "processing_results":
-                []
+                [],
         }
 
         if not incoming_history_id:
@@ -2240,6 +2785,9 @@ async def gmail_pubsub_webhook(
                     "notification_received"
             }
 
+        # Establish baseline after restart
+        # if a Watch has not been manually
+        # initialized yet.
         if last_history_id is None:
             last_history_id = (
                 incoming_history_id
@@ -2301,7 +2849,7 @@ async def gmail_pubsub_webhook(
             "status":
                 "gmail_history_error",
             "error":
-                str(error)
+                str(error),
         }
 
         return {
@@ -2314,48 +2862,12 @@ async def gmail_pubsub_webhook(
             "status":
                 "processing_error",
             "error":
-                str(error)
+                str(error),
         }
 
         return {
             "status":
                 "notification_error"
-        }
-
-# =========================================================
-# TEST: Process READY Residents
-#
-# Temporary manual trigger.
-# Later this will be called by the orchestrator.
-# =========================================================
-
-@app.get("/test/process-ready")
-def test_process_ready():
-    try:
-        result = (
-            process_all_ready_residents()
-        )
-
-        return {
-            "status":
-                "ready_processing_complete",
-            **result
-        }
-
-    except HttpError as error:
-        return {
-            "status":
-                "google_api_error",
-            "error":
-                str(error)
-        }
-
-    except Exception as error:
-        return {
-            "status":
-                "processing_error",
-            "error":
-                str(error)
         }
 
 
@@ -2365,7 +2877,6 @@ def test_process_ready():
 
 @app.get("/test/latest-notification")
 def get_latest_notification():
-
     if (
         latest_gmail_notification
         is None
@@ -2379,13 +2890,12 @@ def get_latest_notification():
         "status":
             "notification_available",
         "notification":
-            latest_gmail_notification
+            latest_gmail_notification,
     }
 
 
 @app.get("/test/latest-authorized-email")
 def get_latest_authorized_email():
-
     if (
         latest_authorized_email
         is None
@@ -2399,7 +2909,7 @@ def get_latest_authorized_email():
         "status":
             "authorized_email_available",
         "email":
-            latest_authorized_email
+            latest_authorized_email,
     }
 
 
@@ -2411,87 +2921,10 @@ def get_runtime_state():
         "processed_message_count":
             len(
                 processed_message_ids
-            )
+            ),
     }
 
-# =========================================================
-# TEST: Repair Existing Pilot Assignment
-#
-# One-time development helper.
-# Used because BL001 was assigned before
-# assignment persistence existed.
-# =========================================================
 
-@app.get(
-    "/test/repair-assignment/{resident_id}/{backlog_id}"
-)
-def test_repair_assignment(
-    resident_id: str,
-    backlog_id: str
-):
-    resident = get_resident_by_id(
-        resident_id
-    )
-
-    if resident is None:
-        return {
-            "status":
-                "resident_not_found"
-        }
-
-    if resident["status"] != "ACTIVE":
-        return {
-            "status":
-                "repair_not_allowed",
-            "reason":
-                "resident_is_not_active",
-            "resident_status":
-                resident["status"]
-        }
-
-    existing = (
-        get_active_assignment_for_resident(
-            resident_id
-        )
-    )
-
-    if existing:
-        return {
-            "status":
-                "assignment_already_exists",
-            "assignment":
-                existing
-        }
-
-    backlog = None
-
-    for item in get_backlogs():
-        if (
-            item["backlog_id"].upper()
-            == backlog_id.upper()
-        ):
-            backlog = item
-            break
-
-    if backlog is None:
-        return {
-            "status":
-                "backlog_not_found"
-        }
-
-    result = create_assignment(
-        resident_id=
-            resident["resident_id"],
-        backlog_id=
-            backlog["backlog_id"]
-    )
-
-    return {
-        "status":
-            "assignment_repaired",
-        "result":
-            result
-    }
 # =========================================================
 # Start / Renew Gmail Inbox Watch
 # =========================================================
@@ -2511,14 +2944,14 @@ def start_gmail_watch():
             "INBOX"
         ],
         "labelFilterBehavior":
-            "INCLUDE"
+            "INCLUDE",
     }
 
     result = (
         gmail.users()
         .watch(
             userId="me",
-            body=request_body
+            body=request_body,
         )
         .execute()
     )
@@ -2541,5 +2974,5 @@ def start_gmail_watch():
                 "expiration"
             ),
         "history_baseline_saved":
-            True
+            True,
     }
