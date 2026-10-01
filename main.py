@@ -1366,13 +1366,22 @@ def process_all_ready_residents():
 
 # =========================================================
 # ACTIVE Scheduled Scrum Templates
+#
+# Escalation policy:
+#
+#  3  -> Normal
+#  2  -> Normal
+#  1  -> Concern
+#  0  -> Concern
+# -1  -> Escalation
+# -2  -> Escalation
+# -3  -> Final Warning
+# -4  -> End active Backlog / INACTIVE
 # =========================================================
 
-def build_scrum_reminder_message(
-    resident,
-    backlog,
-):
-    first_name = (
+
+def get_resident_first_name(resident):
+    return (
         resident["name"]
         .strip()
         .split()[0]
@@ -1380,12 +1389,30 @@ def build_scrum_reminder_message(
         else "Resident"
     )
 
-    subject = (
-        f"Scrum Check-in — "
-        f"{backlog['backlog_id']}"
+
+# =========================================================
+# Level 1: Normal Scrum
+# Counter 3 and 2
+# =========================================================
+
+def build_normal_scrum_message(
+    resident,
+    backlog,
+    counter,
+):
+    first_name = (
+        get_resident_first_name(
+            resident
+        )
     )
 
-    body = f"""Hi {first_name},
+    if counter == 3:
+        subject = (
+            f"Scrum Check-in — "
+            f"{backlog['backlog_id']}"
+        )
+
+        body = f"""Hi {first_name},
 
 Just checking in on your current Backlog:
 
@@ -1404,40 +1431,261 @@ John Doe
 Scrum Master
 The Tech Residency Program"""
 
+    else:
+        subject = (
+            f"Scrum Follow-up — "
+            f"{backlog['backlog_id']}"
+        )
+
+        body = f"""Hi {first_name},
+
+Following up on your current Backlog:
+
+{backlog['backlog_id']} — {backlog['title']}
+
+I haven't received your latest progress update yet.
+
+Please reply with a brief update on what you've completed, what you're currently working on, and whether anything is blocking you.
+
+If you're facing a problem, let me know so we can address it early.
+
+Regards,
+John Doe
+Scrum Master
+The Tech Residency Program"""
+
     return {
         "subject": subject,
         "body": body,
     }
 
 
-def build_scrum_warning_message(
+# =========================================================
+# Level 2: Concern
+# Counter 1 and 0
+# =========================================================
+
+def build_concern_scrum_message(
+    resident,
+    backlog,
+    counter,
+):
+    first_name = (
+        get_resident_first_name(
+            resident
+        )
+    )
+
+    if counter == 1:
+        subject = (
+            f"Progress Update Due — "
+            f"{backlog['backlog_id']}"
+        )
+
+        body = f"""Hi {first_name},
+
+I'm still waiting for a progress update on your active Backlog:
+
+{backlog['backlog_id']} — {backlog['title']}
+
+We've had more than one check-in without an update, so I'd like to understand where the work currently stands.
+
+Please reply with:
+
+- Your current progress
+- What you're working on now
+- Any blocker or difficulty you're facing
+
+Even if progress has been limited, please send an update. If something is preventing you from continuing, let me know so we can address it.
+
+Regards,
+John Doe
+Scrum Master
+The Tech Residency Program"""
+
+    else:
+        subject = (
+            f"Progress Update Required — "
+            f"{backlog['backlog_id']}"
+        )
+
+        body = f"""Hi {first_name},
+
+We still haven't received a progress update for your active Backlog:
+
+{backlog['backlog_id']} — {backlog['title']}
+
+Regular communication is an important part of the residency workflow, particularly while a Backlog is active.
+
+Please reply with your current progress or explain what is preventing you from continuing.
+
+If you're blocked, unavailable, or facing another issue, simply let me know. The immediate priority is to understand the current status of the work.
+
+Continued absence of progress updates will move the Backlog into the escalation stage.
+
+Regards,
+John Doe
+Scrum Master
+The Tech Residency Program"""
+
+    return {
+        "subject": subject,
+        "body": body,
+    }
+
+
+# =========================================================
+# Level 3: Escalation
+# Counter -1 and -2
+# =========================================================
+
+def build_escalation_scrum_message(
+    resident,
+    backlog,
+    counter,
+):
+    first_name = (
+        get_resident_first_name(
+            resident
+        )
+    )
+
+    if counter == -1:
+        subject = (
+            f"Escalation: Progress Update Required — "
+            f"{backlog['backlog_id']}"
+        )
+
+        body = f"""Hi {first_name},
+
+Your active Backlog has now entered the escalation stage because we have not received a progress update after multiple check-ins.
+
+Backlog:
+
+{backlog['backlog_id']} — {backlog['title']}
+
+Please reply as soon as possible with your current status.
+
+You may report completed work, work in progress, a blocker, temporary unavailability, or any other issue affecting the assignment.
+
+The purpose of this escalation is to establish whether the Backlog is still actively being worked on.
+
+If we continue to receive no response, the Backlog will move toward closure due to inactivity.
+
+Regards,
+John Doe
+Scrum Master
+The Tech Residency Program"""
+
+    else:
+        subject = (
+            f"Escalation Reminder: Response Required — "
+            f"{backlog['backlog_id']}"
+        )
+
+        body = f"""Hi {first_name},
+
+This is a further escalation regarding your active Backlog:
+
+{backlog['backlog_id']} — {backlog['title']}
+
+We have not received a response despite repeated Scrum check-ins and the previous escalation.
+
+Please reply with your current status, even if you have not been able to make progress.
+
+If there is a blocker or a genuine reason for the inactivity, include it in your response so that it can be considered.
+
+Without a response, the current Backlog will proceed to a final inactivity warning.
+
+Regards,
+John Doe
+Scrum Master
+The Tech Residency Program"""
+
+    return {
+        "subject": subject,
+        "body": body,
+    }
+
+
+# =========================================================
+# Level 4: Final Warning
+# Counter -3
+# =========================================================
+
+def build_final_warning_message(
     resident,
     backlog,
 ):
     first_name = (
-        resident["name"]
-        .strip()
-        .split()[0]
-        if resident["name"].strip()
-        else "Resident"
+        get_resident_first_name(
+            resident
+        )
     )
 
     subject = (
-        f"Progress Update Required — "
+        f"Final Warning: Response Required — "
         f"{backlog['backlog_id']}"
     )
 
     body = f"""Hi {first_name},
 
-I haven't received a recent progress update for your current Backlog:
+This is the final inactivity warning for your active Backlog:
 
 {backlog['backlog_id']} — {backlog['title']}
 
-Please reply with a quick update, even if you haven't been able to make progress.
+We have not received the required progress updates despite multiple check-ins and escalation messages.
 
-If you're facing a blocker, workload issue, or need clarification, let me know. The purpose of the check-in is to understand where things stand and help you move forward.
+Please reply before the next Scrum cycle with your current progress, blocker, reason for inactivity, or any other relevant update.
 
-Please don't leave the Backlog without an update for an extended period.
+Any genuine response will allow us to understand your situation and continue the residency workflow appropriately.
+
+If no response is received before the next Scrum cycle, the current Backlog will be closed due to inactivity and your residency status will be moved to INACTIVE.
+
+Regards,
+John Doe
+Scrum Master
+The Tech Residency Program"""
+
+    return {
+        "subject": subject,
+        "body": body,
+    }
+
+
+# =========================================================
+# Level 5: Backlog Closed
+# Counter -4
+# =========================================================
+
+def build_inactivity_closure_message(
+    resident,
+    backlog,
+):
+    first_name = (
+        get_resident_first_name(
+            resident
+        )
+    )
+
+    subject = (
+        f"Backlog Closed Due to Inactivity — "
+        f"{backlog['backlog_id']}"
+    )
+
+    body = f"""Hi {first_name},
+
+Your current Backlog has been closed due to continued inactivity and the absence of a response to the previous Scrum check-ins.
+
+Closed Backlog:
+
+{backlog['backlog_id']} — {backlog['title']}
+
+Your residency status has now been moved to INACTIVE.
+
+This does not automatically mean that your participation in The Tech Residency Program has been terminated. If you are ready to resume your residency, please reply to this email.
+
+Further instructions will be provided based on your residency status.
 
 Regards,
 John Doe
@@ -1452,10 +1700,6 @@ The Tech Residency Program"""
 
 # =========================================================
 # ACTIVE Scheduled Scrum Lifecycle
-#
-# Counter 3,2,1  -> normal Scrum reminder
-# Counter 0..-3  -> warning
-# Counter < -3   -> INACTIVE / discard assignment
 # =========================================================
 
 def process_scheduled_active_resident(
@@ -1491,11 +1735,51 @@ def process_scheduled_active_resident(
     )
 
     # -----------------------------------------------------
-    # Counter already below -3.
-    # Discard Backlog and make resident INACTIVE.
+    # Counter -4 or lower
+    #
+    # End the active Backlog.
+    # Assignment -> DISCARDED
+    # Resident -> INACTIVE / 0
+    # Send closure notification.
     # -----------------------------------------------------
 
-    if counter < -3:
+    if counter <= -4:
+
+        closure_message = (
+            build_inactivity_closure_message(
+                resident=resident,
+                backlog=backlog,
+            )
+        )
+
+        # Send closure email before changing state.
+        sent_message = send_email(
+            recipient=
+                resident["email"],
+            subject=
+                closure_message["subject"],
+            body=
+                closure_message["body"],
+        )
+
+        sent_message_id = (
+            sent_message.get("id")
+        )
+
+        if not sent_message_id:
+            return {
+                "resident_id":
+                    resident["resident_id"],
+                "assignment_id":
+                    assignment["assignment_id"],
+                "backlog_id":
+                    backlog["backlog_id"],
+                "action":
+                    "failed",
+                "reason":
+                    "inactivity_closure_email_not_confirmed",
+            }
+
         assignment_update = (
             update_assignment_status(
                 sheet_row=
@@ -1522,6 +1806,10 @@ def process_scheduled_active_resident(
                 backlog["backlog_id"],
             "action":
                 "resident_moved_inactive",
+            "message_level":
+                "closure",
+            "sent_message_id":
+                sent_message_id,
             "old_status":
                 "ACTIVE",
             "new_status":
@@ -1539,38 +1827,77 @@ def process_scheduled_active_resident(
         }
 
     # -----------------------------------------------------
-    # Counter 1 to 3.
-    # Normal Scrum reminder.
+    # Counter 3 and 2
+    # Normal Scrum
     # -----------------------------------------------------
 
-    if counter > 0:
+    if counter >= 2:
+
         message = (
-            build_scrum_reminder_message(
+            build_normal_scrum_message(
                 resident=resident,
                 backlog=backlog,
+                counter=counter,
             )
         )
 
-        message_type = (
-            "scrum_reminder"
-        )
+        message_level = "normal"
 
     # -----------------------------------------------------
-    # Counter 0 to -3.
-    # Warning.
+    # Counter 1 and 0
+    # Concern
+    # -----------------------------------------------------
+
+    elif counter >= 0:
+
+        message = (
+            build_concern_scrum_message(
+                resident=resident,
+                backlog=backlog,
+                counter=counter,
+            )
+        )
+
+        message_level = "concern"
+
+    # -----------------------------------------------------
+    # Counter -1 and -2
+    # Escalation
+    # -----------------------------------------------------
+
+    elif counter >= -2:
+
+        message = (
+            build_escalation_scrum_message(
+                resident=resident,
+                backlog=backlog,
+                counter=counter,
+            )
+        )
+
+        message_level = "escalation"
+
+    # -----------------------------------------------------
+    # Counter -3
+    # Final Warning
     # -----------------------------------------------------
 
     else:
+
         message = (
-            build_scrum_warning_message(
+            build_final_warning_message(
                 resident=resident,
                 backlog=backlog,
             )
         )
 
-        message_type = (
-            "scrum_warning"
+        message_level = (
+            "final_warning"
         )
+
+    # -----------------------------------------------------
+    # Send selected Scrum message.
+    # -----------------------------------------------------
 
     sent_message = send_email(
         recipient=
@@ -1589,11 +1916,22 @@ def process_scheduled_active_resident(
         return {
             "resident_id":
                 resident["resident_id"],
+            "assignment_id":
+                assignment["assignment_id"],
+            "backlog_id":
+                backlog["backlog_id"],
             "action":
                 "failed",
             "reason":
                 "scrum_email_not_confirmed",
+            "message_level":
+                message_level,
         }
+
+    # -----------------------------------------------------
+    # Successful Scrum cycle:
+    # decrement counter by one.
+    # -----------------------------------------------------
 
     new_counter = (
         counter - 1
@@ -1615,7 +1953,9 @@ def process_scheduled_active_resident(
         "backlog_id":
             backlog["backlog_id"],
         "action":
-            message_type,
+            "scrum_message_sent",
+        "message_level":
+            message_level,
         "sent_message_id":
             sent_message_id,
         "old_counter":
