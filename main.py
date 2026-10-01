@@ -14,6 +14,7 @@ from google_auth_oauthlib.flow import Flow
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 
+from fastapi import FastAPI, Request
 
 app = FastAPI(title="Residency Pre-Pilot Backend")
 
@@ -487,3 +488,26 @@ def process_latest_email():
         "sent_message_id": sent_message.get("id"),
         "thread_id": sent_message.get("threadId")
     }
+    
+# =========================================================
+# Gmail Pub/Sub Webhook
+# =========================================================
+
+@app.post("/webhooks/gmail")
+async def gmail_pubsub_webhook(request: Request):
+    try:
+        payload = await request.json()
+
+        return {
+            "status": "notification_received",
+            "pubsub_message_id": (
+                payload
+                .get("message", {})
+                .get("messageId")
+            )
+        }
+
+    except Exception:
+        return {
+            "status": "notification_received"
+        }
