@@ -934,17 +934,14 @@ def google_auth():
     )
 
     authorization_url, _ = (
-        flow.authorization_url(
-            access_type="offline",
-            include_granted_scopes="true",
-            prompt="consent",
-            state=state,
-            code_challenge=
-                code_challenge,
-            code_challenge_method=
-                "S256",
-        )
+    flow.authorization_url(
+        access_type="offline",
+        prompt="consent",
+        state=state,
+        code_challenge=code_challenge,
+        code_challenge_method="S256",
     )
+)
 
     return RedirectResponse(
         authorization_url
