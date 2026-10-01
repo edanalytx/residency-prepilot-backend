@@ -930,6 +930,151 @@ def get_new_message_ids(
         message_ids
     )
 
+# =========================================================
+# Threaded Reply Helper
+# =========================================================
+
+def send_threaded_reply(
+    message,
+    body
+):
+    gmail = get_gmail_service()
+
+    original_subject = (
+        message["subject"]
+        if message["subject"]
+        else "The Tech Residency Program"
+    )
+
+    if original_subject.lower().startswith("re:"):
+        reply_subject = original_subject
+    else:
+        reply_subject = f"Re: {original_subject}"
+
+    email_message = EmailMessage()
+
+    email_message["To"] = (
+        message["sender_email"]
+    )
+
+    email_message["Subject"] = (
+        reply_subject
+    )
+
+    if message["rfc_message_id"]:
+        email_message["In-Reply-To"] = (
+            message["rfc_message_id"]
+        )
+
+        email_message["References"] = (
+            message["rfc_message_id"]
+        )
+
+    email_message.set_content(body)
+
+    encoded_message = (
+        base64.urlsafe_b64encode(
+            email_message.as_bytes()
+        )
+        .decode()
+    )
+
+    sent_message = (
+        gmail.users()
+        .messages()
+        .send(
+            userId="me",
+            body={
+                "raw": encoded_message,
+                "threadId": message["thread_id"]
+            }
+        )
+        .execute()
+    )
+
+    return sent_message
+
+
+# =========================================================
+# PENDING -> READY
+# Static Onboarding Completion
+# =========================================================
+
+def process_pending_reply(
+    resident,
+    message
+):
+    first_name = (
+        resident["name"]
+        .strip()
+        .split()[0]
+        if resident["name"].strip()
+        else "Resident"
+    )
+
+    body = f"""Hi {first_name},
+
+Thanks for sharing your details. Your onboarding is now complete.
+
+You're now ready to begin your residency with The Tech Residency Program.
+
+You'll be working on a real-world-style project that has been divided into smaller engineering Backlogs. Each Backlog represents a specific piece of work with clear requirements, expected outputs, and completion conditions.
+
+You don't need to understand the entire project before starting. You'll gradually become familiar with the system as you work through different Backlogs.
+
+Your work will be maintained in GitHub, and I'll periodically check in with you through our Scrum emails while you're working on an assignment.
+
+Your first Backlog will be assigned shortly.
+
+Welcome to the team.
+
+Regards,
+John Doe
+Tech Lead
+The Tech Residency Program"""
+
+    # Send response first.
+    sent_message = send_threaded_reply(
+        message=message,
+        body=body
+    )
+
+    sent_message_id = (
+        sent_message.get("id")
+    )
+
+    if not sent_message_id:
+        return {
+            "resident_id":
+                resident["resident_id"],
+            "action":
+                "failed",
+            "reason":
+                "onboarding_reply_not_confirmed"
+        }
+
+    # Only move to READY after
+    # successful Gmail send.
+    update_result = update_resident_state(
+        sheet_row=resident["sheet_row"],
+        status="READY"
+    )
+
+    return {
+        "resident_id":
+            resident["resident_id"],
+        "action":
+            "onboarding_completed",
+        "sent_message_id":
+            sent_message_id,
+        "old_status":
+            "PENDING",
+        "new_status":
+            "READY",
+        "sheet_update":
+            update_result
+    }
+
 
 # =========================================================
 # Process Exact Gmail Message
@@ -1042,6 +1187,55 @@ def process_message(message_id):
         "snippet":
             full_message["snippet"]
     }
+
+        # -----------------------------------------------------
+    # Residency State Routing
+    # -----------------------------------------------------
+
+    if authorization["status"] == "PENDING":
+
+        resident = {
+            "resident_id":
+                authorization["resident_id"],
+            "name":
+                authorization["name"],
+            "email":
+                authorization["email"],
+            "status":
+                authorization["status"],
+            "counter":
+                authorization["counter"],
+            "mentor":
+                authorization["mentor"],
+            "sheet_row":
+                authorization["sheet_row"]
+        }
+
+        onboarding_result = (
+            process_pending_reply(
+                resident=resident,
+                message=message
+            )
+        )
+
+        processed_message_ids.add(
+            message_id
+        )
+
+        return {
+            "message_id":
+                message_id,
+            "sender_email":
+                message["sender_email"],
+            "resident_id":
+                authorization["resident_id"],
+            "resident_name":
+                authorization["name"],
+            "action":
+                "pending_reply_processed",
+            "onboarding":
+                onboarding_result
+        }
 
     processed_message_ids.add(
         message_id
