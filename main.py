@@ -37,6 +37,7 @@ latest_authorized_email = None
 last_history_id = None
 
 processed_message_ids = set()
+MAX_PROCESSED_MESSAGE_IDS = 1000
 
 
 # =========================================================
@@ -102,18 +103,28 @@ def get_google_credentials():
 # =========================================================
 
 def get_gmail_service():
+    # Discovery documents do not need to be cached for this
+    # small stateless service. Disabling discovery caching
+    # avoids unnecessary cache work and keeps client creation
+    # lightweight on the 512 MB Render instance.
     return build(
         "gmail",
         "v1",
         credentials=get_google_credentials(),
+        cache_discovery=False,
     )
 
 
 def get_sheets_service():
+    # Keep service construction lightweight. We intentionally
+    # create request-local Google API clients rather than one
+    # global httplib2 client, because the latter is not safe to
+    # share across concurrent requests.
     return build(
         "sheets",
         "v4",
         credentials=get_google_credentials(),
+        cache_discovery=False,
     )
 
 # =========================================================
@@ -3048,6 +3059,13 @@ def get_new_message_ids(
 
 def process_message(message_id):
     global latest_authorized_email
+
+    # Runtime duplicate protection is intentionally bounded.
+    # The durable Gmail history cursor is the authoritative
+    # cross-restart position; this set only suppresses repeated
+    # processing inside the current instance.
+    if len(processed_message_ids) > MAX_PROCESSED_MESSAGE_IDS:
+        processed_message_ids.clear()
 
     if (
         message_id
