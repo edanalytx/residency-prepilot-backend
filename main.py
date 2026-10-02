@@ -996,6 +996,57 @@ def update_assignment_status(
     }
 
 
+def record_assignment_submission(
+    sheet_row,
+    github_url,
+):
+    submitted_at = (
+        datetime.now(timezone.utc)
+        .isoformat()
+    )
+
+    sheets = get_sheets_service()
+
+    result = (
+        sheets.spreadsheets()
+        .values()
+        .batchUpdate(
+            spreadsheetId=
+                RESIDENT_REGISTRY_SPREADSHEET_ID,
+            body={
+                "valueInputOption": "RAW",
+                "data": [
+                    {
+                        "range":
+                            f"Assignments!D{sheet_row}",
+                        "values": [["SUBMITTED"]],
+                    },
+                    {
+                        "range":
+                            f"Assignments!F{sheet_row}:G{sheet_row}",
+                        "values": [[
+                            submitted_at,
+                            github_url,
+                        ]],
+                    },
+                ],
+            },
+        )
+        .execute()
+    )
+
+    return {
+        "updated": True,
+        "status": "SUBMITTED",
+        "submitted_at": submitted_at,
+        "github_url": github_url,
+        "updated_cells": result.get(
+            "totalUpdatedCells",
+            0,
+        ),
+    }
+
+
 # =========================================================
 # Current Work Context
 # =========================================================
@@ -2329,6 +2380,147 @@ def process_all_active_residents():
 # THIS is the future Scrum AI insertion point.
 # =========================================================
 
+def extract_submission_github_url(body):
+    if not body:
+        return None
+
+    # Pre-pilot deterministic submission protocol:
+    # SUBMIT: https://github.com/<owner>/<repository>
+    match = re.search(
+        r"(?im)^\s*SUBMIT\s*:\s*"
+        r"(https?://(?:www\.)?github\.com/"
+        r"[^\s<>]+)",
+        body,
+    )
+
+    if not match:
+        return None
+
+    github_url = (
+        match.group(1)
+        .strip()
+        .rstrip(".,);]")
+    )
+
+    return github_url
+
+
+def process_active_submission(
+    resident,
+    message,
+    github_url,
+):
+    work_context = (
+        get_current_work_context(
+            resident["resident_id"]
+        )
+    )
+
+    if work_context is None:
+        return {
+            "resident_id":
+                resident["resident_id"],
+            "action":
+                "failed",
+            "reason":
+                "active_assignment_not_found",
+        }
+
+    assignment = (
+        work_context["assignment"]
+    )
+
+    backlog = (
+        work_context["backlog"]
+    )
+
+    first_name = (
+        resident["name"]
+        .strip()
+        .split()[0]
+        if resident["name"].strip()
+        else "Resident"
+    )
+
+    body = f"""Hi {first_name},
+
+Your submission for {backlog['backlog_id']} — {backlog['title']} has been received.
+
+GitHub repository:
+{github_url}
+
+The submission has been recorded and will move to the evaluation process.
+
+Regards,
+John Doe
+Tech Lead
+The Tech Residency Program"""
+
+    # Acknowledge first. State changes only after Gmail
+    # confirms that the acknowledgement was sent.
+    sent_message = (
+        send_threaded_reply(
+            message=message,
+            body=body,
+        )
+    )
+
+    sent_message_id = (
+        sent_message.get("id")
+    )
+
+    if not sent_message_id:
+        return {
+            "resident_id":
+                resident["resident_id"],
+            "action":
+                "failed",
+            "reason":
+                "submission_acknowledgement_not_confirmed",
+        }
+
+    assignment_update = (
+        record_assignment_submission(
+            sheet_row=
+                assignment["sheet_row"],
+            github_url=
+                github_url,
+        )
+    )
+
+    resident_update = (
+        update_resident_state(
+            sheet_row=
+                resident["sheet_row"],
+            status=
+                "SUBMITTED",
+        )
+    )
+
+    return {
+        "resident_id":
+            resident["resident_id"],
+        "assignment_id":
+            assignment["assignment_id"],
+        "backlog_id":
+            backlog["backlog_id"],
+        "action":
+            "submission_recorded",
+        "github_url":
+            github_url,
+        "sent_message_id":
+            sent_message_id,
+        "old_status":
+            "ACTIVE",
+        "new_status":
+            "SUBMITTED",
+        "assignment_update":
+            assignment_update,
+        "resident_update":
+            resident_update,
+    }
+
+
 def process_active_reply(
     resident,
     message,
@@ -2369,10 +2561,6 @@ def process_active_reply(
         resident["counter"]
     )
 
-    # -----------------------------------------------------
-    # Build acknowledgement.
-    # -----------------------------------------------------
-
     body = f"""Hi {first_name},
 
 Thanks for the update on {backlog['backlog_id']} — {backlog['title']}.
@@ -2381,19 +2569,14 @@ I've noted your progress. Please continue with the Backlog and keep committing y
 
 If you run into a blocker or need clarification, reply to this thread with the details and we'll work through it.
 
-When the Backlog is complete, send the GitHub repository link in your reply for submission.
+When the Backlog is complete, submit it using this exact format:
+
+SUBMIT: https://github.com/your-username/your-repository
 
 Regards,
 John Doe
 Scrum Master
 The Tech Residency Program"""
-
-    # -----------------------------------------------------
-    # Send acknowledgement first.
-    #
-    # Resident state is changed only after Gmail confirms
-    # that the acknowledgement was sent successfully.
-    # -----------------------------------------------------
 
     sent_message = (
         send_threaded_reply(
@@ -2416,14 +2599,9 @@ The Tech Residency Program"""
                 "scrum_reply_not_confirmed",
         }
 
-    # -----------------------------------------------------
-    # ACTIVE communication recovery.
-    #
-    # Any successfully processed ACTIVE resident reply
-    # restores the communication counter to 2.
-    # -----------------------------------------------------
-
-    new_counter = 2
+    # Any successfully processed meaningful ACTIVE reply
+    # restores the communication counter to 3.
+    new_counter = 3
 
     update_result = (
         update_resident_state(
@@ -3054,14 +3232,50 @@ def process_message(message_id):
         }
 
     # -----------------------------------------------------
-    # ACTIVE -> Scrum interaction
+    # ACTIVE inbound routing
     #
-    # Any successfully processed ACTIVE resident email
-    # is acknowledged in the same Gmail thread and
-    # restores Counter directly to 2.
+    # Pre-pilot submission protocol:
+    # SUBMIT: <GitHub repository URL>
+    #
+    # Everything else is handled as a Scrum update.
     # -----------------------------------------------------
 
     if authorization["status"] == "ACTIVE":
+        submission_github_url = (
+            extract_submission_github_url(
+                full_message["body"]
+            )
+        )
+
+        if submission_github_url:
+            submission_result = (
+                process_active_submission(
+                    resident=resident,
+                    message=message,
+                    github_url=
+                        submission_github_url,
+                )
+            )
+
+            processed_message_ids.add(
+                message_id
+            )
+
+            return {
+                "message_id":
+                    message_id,
+                "sender_email":
+                    message["sender_email"],
+                "resident_id":
+                    authorization["resident_id"],
+                "resident_name":
+                    authorization["name"],
+                "action":
+                    "active_submission_processed",
+                "submission":
+                    submission_result,
+            }
+
         scrum_result = (
             process_active_reply(
                 resident=resident,
