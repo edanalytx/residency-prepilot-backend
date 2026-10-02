@@ -2130,22 +2130,20 @@ def process_all_active_residents():
 #
 # Static Scrum response for now.
 #
-# Communication recovery policy:
+# Pre-pilot communication recovery policy:
 #
-# 1. Only a reply belonging to the CURRENT Scrum thread
-#    can recover a communication point.
+# - Any successfully processed email/reply from a
+#   resident whose current status is ACTIVE is treated
+#   as communication from that resident.
 #
-# 2. Only the FIRST valid reply in that Scrum cycle
-#    can recover a point.
+# - After the acknowledgement is successfully sent,
+#   the resident's communication Counter is set to 2.
 #
-# 3. Additional replies in the same Scrum cycle
-#    are acknowledged but do not recover more points.
+# - No Gmail thread matching is required.
+# - No gradual counter recovery is used.
 #
-# 4. Replies to older Scrum threads are acknowledged
-#    but do not recover communication points.
-#
-# 5. A valid recovery increases the counter by 1,
-#    capped at 3.
+# Counter 3 remains reserved for the beginning of a
+# newly assigned Backlog.
 #
 # THIS is the future Scrum AI insertion point.
 # =========================================================
@@ -2186,81 +2184,12 @@ def process_active_reply(
         else "Resident"
     )
 
-    # -----------------------------------------------------
-    # Read current Scrum communication state.
-    # -----------------------------------------------------
-
-    current_scrum_thread_id = (
-        resident.get(
-            "scrum_thread_id",
-            ""
-        )
-    )
-
-    incoming_thread_id = (
-        message.get(
-            "thread_id",
-            ""
-        )
-    )
-
-    scrum_replied = (
-        resident.get(
-            "scrum_replied",
-            False,
-        )
-    )
-
-    # -----------------------------------------------------
-    # Determine whether the incoming message belongs
-    # to the CURRENT Scrum cycle.
-    #
-    # Exact Gmail thread matching prevents old/backdated
-    # Scrum replies from earning recovery credit.
-    # -----------------------------------------------------
-
-    is_current_scrum_thread = (
-        bool(current_scrum_thread_id)
-        and
-        bool(incoming_thread_id)
-        and
-        incoming_thread_id
-        == current_scrum_thread_id
-    )
-
-    # -----------------------------------------------------
-    # Exactly one recovery point may be awarded for
-    # each current Scrum cycle.
-    # -----------------------------------------------------
-
-    recovery_allowed = (
-        is_current_scrum_thread
-        and
-        not scrum_replied
-    )
-
     current_counter = (
         resident["counter"]
     )
 
-    if current_counter is None:
-        current_counter = 3
-
-    if recovery_allowed:
-        new_counter = min(
-            current_counter + 1,
-            3,
-        )
-    else:
-        new_counter = (
-            current_counter
-        )
-
     # -----------------------------------------------------
     # Build acknowledgement.
-    #
-    # All ACTIVE resident messages are acknowledged.
-    # Communication credit is handled independently.
     # -----------------------------------------------------
 
     body = f"""Hi {first_name},
@@ -2277,6 +2206,13 @@ Regards,
 John Doe
 Scrum Master
 The Tech Residency Program"""
+
+    # -----------------------------------------------------
+    # Send acknowledgement first.
+    #
+    # Resident state is changed only after Gmail confirms
+    # that the acknowledgement was sent successfully.
+    # -----------------------------------------------------
 
     sent_message = (
         send_threaded_reply(
@@ -2300,74 +2236,22 @@ The Tech Residency Program"""
         }
 
     # -----------------------------------------------------
-    # Apply communication recovery.
+    # ACTIVE communication recovery.
     #
-    # FIRST reply to current Scrum:
-    #   Counter +1, maximum 3
-    #   Scrum_Replied = TRUE
-    #
-    # Further replies to current Scrum:
-    #   No counter change
-    #
-    # Old/non-current Scrum replies:
-    #   No counter change
+    # Any successfully processed ACTIVE resident reply
+    # restores the communication counter to 2.
     # -----------------------------------------------------
 
-    if recovery_allowed:
+    new_counter = 2
 
-        update_result = (
-            update_resident_state(
-                sheet_row=
-                    resident["sheet_row"],
-                counter=
-                    new_counter,
-                scrum_replied=
-                    True,
-            )
+    update_result = (
+        update_resident_state(
+            sheet_row=
+                resident["sheet_row"],
+            counter=
+                new_counter,
         )
-
-        reply_classification = (
-            "current_scrum_first_reply"
-        )
-
-    elif is_current_scrum_thread:
-
-        update_result = {
-            "updated":
-                False,
-            "updated_cells":
-                0,
-        }
-
-        reply_classification = (
-            "current_scrum_additional_reply"
-        )
-
-    elif current_scrum_thread_id:
-
-        update_result = {
-            "updated":
-                False,
-            "updated_cells":
-                0,
-        }
-
-        reply_classification = (
-            "old_scrum_reply"
-        )
-
-    else:
-
-        update_result = {
-            "updated":
-                False,
-            "updated_cells":
-                0,
-        }
-
-        reply_classification = (
-            "no_current_scrum_cycle"
-        )
+    )
 
     return {
         "resident_id":
@@ -2377,19 +2261,11 @@ The Tech Residency Program"""
         "backlog_id":
             backlog["backlog_id"],
         "action":
-            "scrum_reply_sent",
-        "reply_classification":
-            reply_classification,
+            "active_reply_acknowledged",
         "sent_message_id":
             sent_message_id,
         "status":
             "ACTIVE",
-        "current_scrum_thread_id":
-            current_scrum_thread_id,
-        "incoming_thread_id":
-            incoming_thread_id,
-        "communication_recovery_awarded":
-            recovery_allowed,
         "old_counter":
             current_counter,
         "new_counter":
@@ -2397,6 +2273,9 @@ The Tech Residency Program"""
         "sheet_update":
             update_result,
     }
+
+
+
 # =========================================================
 # Gmail Metadata Helpers
 # =========================================================
