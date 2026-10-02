@@ -2,6 +2,7 @@ import os
 import base64
 import json
 import re
+import socket
 from datetime import datetime, timezone
 from email.message import EmailMessage
 from email.utils import parseaddr
@@ -11,6 +12,20 @@ from fastapi.responses import RedirectResponse
 from google_auth_oauthlib.flow import Flow
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
+
+
+# WSL on the Predator resolves Google endpoints to both IPv4 and IPv6 even
+# though IPv6 is not routable. Restrict this process to IPv4 DNS results so
+# google-auth/httplib2 cannot fall through to an unusable IPv6 address.
+_original_getaddrinfo = socket.getaddrinfo
+
+
+def _ipv4_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+    requested_family = socket.AF_INET if family in (0, socket.AF_UNSPEC) else family
+    return _original_getaddrinfo(host, port, requested_family, type, proto, flags)
+
+
+socket.getaddrinfo = _ipv4_getaddrinfo
 
 
 app = FastAPI(title="Residency Pre-Pilot Backend")
