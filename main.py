@@ -385,6 +385,233 @@ def update_resident_state(
 
 
 # =========================================================
+# Persistent System State
+#
+# System_State
+# A = Key
+# B = Value
+# =========================================================
+
+SYSTEM_STATE_SHEET = "System_State"
+GMAIL_HISTORY_STATE_KEY = "GMAIL_LAST_HISTORY_ID"
+
+
+def ensure_system_state_sheet():
+    sheets = get_sheets_service()
+
+    spreadsheet = (
+        sheets.spreadsheets()
+        .get(
+            spreadsheetId=RESIDENT_REGISTRY_SPREADSHEET_ID,
+            fields="sheets.properties.title",
+        )
+        .execute()
+    )
+
+    titles = {
+        item.get("properties", {}).get("title")
+        for item in spreadsheet.get("sheets", [])
+    }
+
+    if SYSTEM_STATE_SHEET not in titles:
+        (
+            sheets.spreadsheets()
+            .batchUpdate(
+                spreadsheetId=RESIDENT_REGISTRY_SPREADSHEET_ID,
+                body={
+                    "requests": [{
+                        "addSheet": {
+                            "properties": {
+                                "title": SYSTEM_STATE_SHEET
+                            }
+                        }
+                    }]
+                },
+            )
+            .execute()
+        )
+
+    result = (
+        sheets.spreadsheets()
+        .values()
+        .get(
+            spreadsheetId=RESIDENT_REGISTRY_SPREADSHEET_ID,
+            range=f"{SYSTEM_STATE_SHEET}!A:B",
+        )
+        .execute()
+    )
+
+    rows = result.get("values", [])
+
+    if not rows:
+        (
+            sheets.spreadsheets()
+            .values()
+            .update(
+                spreadsheetId=RESIDENT_REGISTRY_SPREADSHEET_ID,
+                range=f"{SYSTEM_STATE_SHEET}!A1:B2",
+                valueInputOption="RAW",
+                body={
+                    "values": [
+                        ["Key", "Value"],
+                        [GMAIL_HISTORY_STATE_KEY, ""],
+                    ]
+                },
+            )
+            .execute()
+        )
+        return
+
+    key_exists = any(
+        len(row) > 0
+        and row[0].strip() == GMAIL_HISTORY_STATE_KEY
+        for row in rows[1:]
+    )
+
+    if not key_exists:
+        (
+            sheets.spreadsheets()
+            .values()
+            .append(
+                spreadsheetId=RESIDENT_REGISTRY_SPREADSHEET_ID,
+                range=f"{SYSTEM_STATE_SHEET}!A:B",
+                valueInputOption="RAW",
+                insertDataOption="INSERT_ROWS",
+                body={
+                    "values": [[
+                        GMAIL_HISTORY_STATE_KEY,
+                        "",
+                    ]]
+                },
+            )
+            .execute()
+        )
+
+
+def get_persistent_gmail_history_id():
+    ensure_system_state_sheet()
+
+    sheets = get_sheets_service()
+
+    result = (
+        sheets.spreadsheets()
+        .values()
+        .get(
+            spreadsheetId=RESIDENT_REGISTRY_SPREADSHEET_ID,
+            range=f"{SYSTEM_STATE_SHEET}!A:B",
+        )
+        .execute()
+    )
+
+    rows = result.get("values", [])
+
+    for row in rows[1:]:
+        if (
+            len(row) > 0
+            and row[0].strip() == GMAIL_HISTORY_STATE_KEY
+        ):
+            if (
+                len(row) < 2
+                or str(row[1]).strip() == ""
+            ):
+                return None
+
+            return int(
+                str(row[1]).strip()
+            )
+
+    return None
+
+
+def set_persistent_gmail_history_id(history_id):
+    ensure_system_state_sheet()
+
+    sheets = get_sheets_service()
+
+    result = (
+        sheets.spreadsheets()
+        .values()
+        .get(
+            spreadsheetId=RESIDENT_REGISTRY_SPREADSHEET_ID,
+            range=f"{SYSTEM_STATE_SHEET}!A:B",
+        )
+        .execute()
+    )
+
+    rows = result.get("values", [])
+    target_row = None
+
+    for row_number, row in enumerate(
+        rows[1:],
+        start=2,
+    ):
+        if (
+            len(row) > 0
+            and row[0].strip()
+            == GMAIL_HISTORY_STATE_KEY
+        ):
+            target_row = row_number
+            break
+
+    if target_row is None:
+        append_result = (
+            sheets.spreadsheets()
+            .values()
+            .append(
+                spreadsheetId=RESIDENT_REGISTRY_SPREADSHEET_ID,
+                range=f"{SYSTEM_STATE_SHEET}!A:B",
+                valueInputOption="RAW",
+                insertDataOption="INSERT_ROWS",
+                body={
+                    "values": [[
+                        GMAIL_HISTORY_STATE_KEY,
+                        int(history_id),
+                    ]]
+                },
+            )
+            .execute()
+        )
+
+        return {
+            "updated": True,
+            "history_id": int(history_id),
+            "updated_range": (
+                append_result
+                .get("updates", {})
+                .get("updatedRange")
+            ),
+        }
+
+    update_result = (
+        sheets.spreadsheets()
+        .values()
+        .update(
+            spreadsheetId=RESIDENT_REGISTRY_SPREADSHEET_ID,
+            range=(
+                f"{SYSTEM_STATE_SHEET}!"
+                f"B{target_row}"
+            ),
+            valueInputOption="RAW",
+            body={
+                "values": [[
+                    int(history_id)
+                ]]
+            },
+        )
+        .execute()
+    )
+
+    return {
+        "updated": True,
+        "history_id": int(history_id),
+        "updated_cells": update_result.get(
+            "updatedCells",
+            0,
+        ),
+    }
+
+
+# =========================================================
 # Backlog Catalog
 #
 # Backlogs
