@@ -2,6 +2,8 @@ import os
 import base64
 import json
 import re
+import threading
+import time
 from datetime import datetime, timezone
 from email.message import EmailMessage
 from email.utils import parseaddr
@@ -33,6 +35,8 @@ latest_gmail_notification = None
 latest_authorized_email = None
 processed_message_ids = set()
 MAX_RUNTIME_MESSAGE_IDS = 500
+GMAIL_POLL_INTERVAL_SECONDS = 30 * 60
+_gmail_poll_lock = threading.Lock()
 
 
 # ---------------------------------------------------------------------
@@ -880,6 +884,30 @@ async def gmail_webhook(request: Request):
 @app.get("/gmail/check")
 def manual_gmail_check():
     return check_gmail_now()
+
+
+def gmail_polling_loop():
+    """Run the same Gmail checker automatically every 30 minutes."""
+    while True:
+        time.sleep(GMAIL_POLL_INTERVAL_SECONDS)
+        if not _gmail_poll_lock.acquire(blocking=False):
+            continue
+        try:
+            try:
+                check_gmail_now()
+            except Exception as exc:
+                print(f"[gmail-poll] {type(exc).__name__}: {exc}", flush=True)
+        finally:
+            _gmail_poll_lock.release()
+
+
+@app.on_event("startup")
+def start_gmail_polling():
+    threading.Thread(
+        target=gmail_polling_loop,
+        name="gmail-polling-loop",
+        daemon=True,
+    ).start()
 
 
 @app.get("/test/latest-notification")
