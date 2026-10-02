@@ -2873,6 +2873,10 @@ def get_new_message_ids(
 # Process Exact Gmail Message
 #
 # This is the inbound state router.
+#
+# Resident communication state is preserved here so
+# downstream lifecycle handlers can determine whether an
+# incoming reply belongs to the current Scrum cycle.
 # =========================================================
 
 def process_message(message_id):
@@ -2954,6 +2958,13 @@ def process_message(message_id):
         )
     )
 
+    # -----------------------------------------------------
+    # Diagnostic copy of the latest authorized email.
+    #
+    # Include current Scrum state so testing endpoints
+    # can show exactly what the inbound router received.
+    # -----------------------------------------------------
+
     latest_authorized_email = {
         "message_id":
             message["message_id"],
@@ -2971,6 +2982,10 @@ def process_message(message_id):
             authorization["counter"],
         "mentor":
             authorization["mentor"],
+        "scrum_thread_id":
+            authorization["scrum_thread_id"],
+        "scrum_replied":
+            authorization["scrum_replied"],
         "sheet_row":
             authorization["sheet_row"],
         "subject":
@@ -2982,6 +2997,16 @@ def process_message(message_id):
         "snippet":
             full_message["snippet"],
     }
+
+    # -----------------------------------------------------
+    # Resident context passed to lifecycle handlers.
+    #
+    # IMPORTANT:
+    # Scrum_Thread_ID and Scrum_Replied must travel with
+    # the resident context. Without them, ACTIVE reply
+    # processing cannot determine whether communication
+    # recovery should be awarded.
+    # -----------------------------------------------------
 
     resident = {
         "resident_id":
@@ -2996,6 +3021,10 @@ def process_message(message_id):
             authorization["counter"],
         "mentor":
             authorization["mentor"],
+        "scrum_thread_id":
+            authorization["scrum_thread_id"],
+        "scrum_replied":
+            authorization["scrum_replied"],
         "sheet_row":
             authorization["sheet_row"],
     }
@@ -3033,6 +3062,18 @@ def process_message(message_id):
 
     # -----------------------------------------------------
     # ACTIVE -> Scrum interaction
+    #
+    # process_active_reply() now receives:
+    #
+    # - current Counter
+    # - current Scrum_Thread_ID
+    # - current Scrum_Replied state
+    #
+    # This allows it to enforce:
+    #
+    # - one recovery point per Scrum cycle
+    # - no multiple-reply recovery
+    # - no backdated Scrum recovery
     # -----------------------------------------------------
 
     if authorization["status"] == "ACTIVE":
@@ -3090,7 +3131,6 @@ def process_message(message_id):
         "action":
             "registered_resident_email_extracted",
     }
-
 
 # =========================================================
 # Basic Endpoints
