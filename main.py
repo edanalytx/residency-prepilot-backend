@@ -3199,22 +3199,16 @@ async def gmail_pubsub_webhook(
     global last_history_id
 
     try:
-        payload = (
-            await request.json()
+        payload = await request.json()
+
+        pubsub_message = payload.get(
+            "message",
+            {},
         )
 
-        pubsub_message = (
-            payload.get(
-                "message",
-                {},
-            )
-        )
-
-        encoded_data = (
-            pubsub_message.get(
-                "data",
-                "",
-            )
+        encoded_data = pubsub_message.get(
+            "data",
+            "",
         )
 
         decoded_data = {}
@@ -3222,8 +3216,7 @@ async def gmail_pubsub_webhook(
         if encoded_data:
             padded_data = (
                 encoded_data
-                + "="
-                * (-len(encoded_data) % 4)
+                + "=" * (-len(encoded_data) % 4)
             )
 
             decoded_bytes = (
@@ -3232,151 +3225,108 @@ async def gmail_pubsub_webhook(
                 )
             )
 
-            decoded_data = (
-                json.loads(
-                    decoded_bytes.decode(
-                        "utf-8"
-                    )
-                )
+            decoded_data = json.loads(
+                decoded_bytes.decode("utf-8")
             )
 
-        incoming_history_id = (
-            decoded_data.get(
-                "historyId"
-            )
+        incoming_history_raw = decoded_data.get(
+            "historyId"
         )
 
+        # The Sheet is authoritative. Runtime state is
+        # only a local cache/diagnostic value.
+        persistent_history_id = (
+            get_persistent_gmail_history_id()
+        )
+
+        last_history_id = persistent_history_id
+
         latest_gmail_notification = {
-            "pubsub_message_id":
-                pubsub_message.get(
-                    "messageId"
-                ),
-            "publish_time":
-                pubsub_message.get(
-                    "publishTime"
-                ),
-            "email_address":
-                decoded_data.get(
-                    "emailAddress"
-                ),
-            "incoming_history_id":
-                incoming_history_id,
-            "previous_history_id":
-                last_history_id,
-            "processing_results":
-                [],
+            "pubsub_message_id": pubsub_message.get(
+                "messageId"
+            ),
+            "publish_time": pubsub_message.get(
+                "publishTime"
+            ),
+            "email_address": decoded_data.get(
+                "emailAddress"
+            ),
+            "incoming_history_id": incoming_history_raw,
+            "previous_history_id": persistent_history_id,
+            "processing_results": [],
         }
 
-        # -------------------------------------------------
-        # Missing Gmail history ID
-        # -------------------------------------------------
-
-        if not incoming_history_id:
+        if not incoming_history_raw:
             latest_gmail_notification[
                 "status"
             ] = "missing_history_id"
 
             return {
-                "status":
-                    "notification_received"
+                "status": "notification_received"
             }
 
-        # -------------------------------------------------
-        # Establish baseline after restart
-        #
-        # Temporary pre-pilot behavior.
-        # Later the cursor will be persisted.
-        # -------------------------------------------------
+        incoming_history_id = int(
+            incoming_history_raw
+        )
 
-        if last_history_id is None:
-            last_history_id = (
+        # This should normally happen only on the first
+        # setup before /test/start-gmail-watch has saved
+        # a baseline.
+        if persistent_history_id is None:
+            set_persistent_gmail_history_id(
                 incoming_history_id
             )
+            last_history_id = incoming_history_id
 
             latest_gmail_notification[
                 "status"
-            ] = (
-                "history_baseline_initialized"
-            )
+            ] = "history_baseline_initialized"
 
             latest_gmail_notification[
                 "new_last_history_id"
-            ] = last_history_id
+            ] = incoming_history_id
 
             return {
-                "status":
-                    "notification_received"
+                "status": "notification_received"
             }
 
-        # -------------------------------------------------
-        # Ignore stale / duplicate Pub/Sub notifications.
-        #
-        # Gmail / Pub/Sub notifications may arrive late
-        # or out of order.
-        #
-        # The history cursor must NEVER move backwards.
-        # -------------------------------------------------
-
         if (
-            int(incoming_history_id)
-            <= int(last_history_id)
+            incoming_history_id
+            <= persistent_history_id
         ):
             latest_gmail_notification[
                 "status"
-            ] = (
-                "stale_notification_ignored"
-            )
+            ] = "stale_notification_ignored"
 
             latest_gmail_notification[
                 "current_history_id"
-            ] = last_history_id
+            ] = persistent_history_id
 
             return {
-                "status":
-                    "notification_received",
-                "action":
-                    "stale_notification_ignored",
+                "status": "notification_received",
+                "action": "stale_notification_ignored",
             }
 
-        # -------------------------------------------------
-        # Retrieve all new INBOX messages since the
-        # previously processed history cursor.
-        # -------------------------------------------------
-
-        previous_history_id = (
-            last_history_id
-        )
-
-        message_ids = (
-            get_new_message_ids(
-                previous_history_id
-            )
+        message_ids = get_new_message_ids(
+            persistent_history_id
         )
 
         processing_results = []
 
         for message_id in message_ids:
-            result = (
-                process_message(
-                    message_id
-                )
+            result = process_message(
+                message_id
             )
-
             processing_results.append(
                 result
             )
 
-        # -------------------------------------------------
-        # Advance cursor only after message processing.
-        #
-        # Because incoming_history_id has already been
-        # verified as greater than last_history_id,
-        # the cursor can only move forward.
-        # -------------------------------------------------
-
-        last_history_id = (
+        # Advance the durable cursor only after every
+        # discovered message has been processed.
+        set_persistent_gmail_history_id(
             incoming_history_id
         )
+        last_history_id = incoming_history_id
 
         latest_gmail_notification[
             "status"
@@ -3388,42 +3338,34 @@ async def gmail_pubsub_webhook(
 
         latest_gmail_notification[
             "new_last_history_id"
-        ] = last_history_id
+        ] = incoming_history_id
 
         return {
-            "status":
-                "notification_received"
+            "status": "notification_received"
         }
 
     except HttpError as error:
         latest_gmail_notification = {
-            "status":
-                "gmail_history_error",
-            "error":
-                str(error),
-            "last_history_id":
-                last_history_id,
+            "status": "gmail_history_error",
+            "error": str(error),
+            "last_history_id": last_history_id,
         }
 
         return {
-            "status":
-                "notification_error"
+            "status": "notification_error"
         }
 
     except Exception as error:
         latest_gmail_notification = {
-            "status":
-                "processing_error",
-            "error":
-                str(error),
-            "last_history_id":
-                last_history_id,
+            "status": "processing_error",
+            "error": str(error),
+            "last_history_id": last_history_id,
         }
 
         return {
-            "status":
-                "notification_error"
+            "status": "notification_error"
         }
+
 
 # =========================================================
 # Diagnostics
@@ -3497,8 +3439,7 @@ def start_gmail_watch():
         "labelIds": [
             "INBOX"
         ],
-        "labelFilterBehavior":
-            "INCLUDE",
+        "labelFilterBehavior": "INCLUDE",
     }
 
     result = (
@@ -3510,10 +3451,8 @@ def start_gmail_watch():
         .execute()
     )
 
-    history_id = (
-        result.get(
-            "historyId"
-        )
+    history_id = result.get(
+        "historyId"
     )
 
     last_history_id = (
@@ -3522,17 +3461,24 @@ def start_gmail_watch():
         else None
     )
 
+    persistent_update = None
+
+    if last_history_id is not None:
+        persistent_update = (
+            set_persistent_gmail_history_id(
+                last_history_id
+            )
+        )
+
     return {
-        "status":
-            "gmail_watch_started",
-        "history_id":
-            result.get(
-                "historyId"
-            ),
-        "expiration":
-            result.get(
-                "expiration"
-            ),
-        "history_baseline_saved":
-            True,
+        "status": "gmail_watch_started",
+        "history_id": last_history_id,
+        "expiration": result.get(
+            "expiration"
+        ),
+        "history_baseline_saved": (
+            last_history_id is not None
+        ),
+        "persistent_state": persistent_update,
     }
+
