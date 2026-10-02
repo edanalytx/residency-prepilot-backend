@@ -629,6 +629,61 @@ def get_new_inbox_message_ids(start_history_id):
 
 
 # ---------------------------------------------------------------------
+# Gmail polling
+# ---------------------------------------------------------------------
+
+def check_gmail_now():
+    """Process new inbox messages since the durable Gmail history cursor."""
+    profile = gmail().users().getProfile(userId="me").execute()
+    current = int(profile["historyId"])
+    previous = get_history_cursor()
+
+    if previous is None:
+        set_history_cursor(current)
+        return {
+            "status": "history_baseline_initialized",
+            "new_last_history_id": current,
+            "message_ids": [],
+            "processing_results": [],
+        }
+
+    if current <= previous:
+        return {
+            "status": "no_new_history",
+            "previous_history_id": previous,
+            "new_last_history_id": current,
+            "message_ids": [],
+            "processing_results": [],
+        }
+
+    message_ids = get_new_inbox_message_ids(previous)
+
+    # Advance the durable cursor before processing. Sending TTRP replies changes
+    # Gmail history; advancing first prevents those outbound changes from causing
+    # the same inbound message to be rediscovered on the next poll.
+    set_history_cursor(current)
+
+    results = []
+    for message_id in message_ids:
+        try:
+            results.append(process_message(message_id))
+        except Exception as exc:
+            results.append({
+                "action": "failed",
+                "message_id": message_id,
+                "error": type(exc).__name__,
+            })
+
+    return {
+        "status": "history_processed",
+        "previous_history_id": previous,
+        "new_last_history_id": current,
+        "message_ids": message_ids,
+        "processing_results": results,
+    }
+
+
+# ---------------------------------------------------------------------
 # Scheduled deterministic processes
 # ---------------------------------------------------------------------
 
@@ -815,6 +870,11 @@ async def gmail_webhook(request: Request):
         "message_ids": message_ids,
         "processing_results": results,
     }
+
+
+@app.get("/gmail/check")
+def manual_gmail_check():
+    return check_gmail_now()
 
 
 @app.get("/test/latest-notification")
