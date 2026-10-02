@@ -903,8 +903,11 @@ def send_threaded_reply(
             body={
                 "raw":
                     encoded_message,
-                "threadId":
-                    message["thread_id"],
+                **(
+                    {"threadId": message["thread_id"]}
+                    if message.get("thread_id")
+                    else {}
+                ),
             },
         )
         .execute()
@@ -1756,17 +1759,13 @@ The Tech Residency Program"""
 # =========================================================
 # ACTIVE Scheduled Scrum Lifecycle
 #
-# Every successfully sent Scrum message opens a new
-# communication cycle.
+# Simplified pre-pilot communication policy:
 #
-# For each new Scrum cycle:
-#
-# - Counter decreases by one.
-# - Gmail thread ID becomes the current Scrum thread.
-# - Scrum_Replied is reset to FALSE.
-#
-# Only the first resident reply to this current thread
-# can later recover one communication point.
+# - A successfully sent scheduled Scrum decreases Counter by one.
+# - No Scrum thread state or Scrum_Replied flag is stored.
+# - Any successfully processed email from an ACTIVE resident
+#   restores Counter directly to 2.
+# - Gmail threading is retained only for conversation continuity.
 # =========================================================
 
 def process_scheduled_active_resident(
@@ -1808,8 +1807,7 @@ def process_scheduled_active_resident(
     # Assignment -> DISCARDED
     # Resident -> INACTIVE / 0
     #
-    # Current Scrum tracking is cleared because there
-    # is no longer an ACTIVE Scrum cycle.
+    # No separate Scrum thread state is stored.
     # -----------------------------------------------------
 
     if counter <= -4:
@@ -1863,8 +1861,6 @@ def process_scheduled_active_resident(
                     resident["sheet_row"],
                 status="INACTIVE",
                 counter=0,
-                scrum_thread_id="",
-                scrum_replied=False,
             )
         )
 
@@ -1891,10 +1887,6 @@ def process_scheduled_active_resident(
                 0,
             "assignment_status":
                 "DISCARDED",
-            "scrum_thread_id":
-                "",
-            "scrum_replied":
-                False,
             "assignment_update":
                 assignment_update,
             "resident_update":
@@ -1987,18 +1979,9 @@ def process_scheduled_active_resident(
         sent_message.get("id")
     )
 
-    sent_thread_id = (
-        sent_message.get("threadId")
-    )
-
     # -----------------------------------------------------
-    # A Scrum cycle is valid only when Gmail confirms
-    # both the message and its thread.
-    #
-    # The thread ID is required to prevent:
-    #
-    # - multiple recovery credits from repeated replies
-    # - recovery credit from replies to old Scrum emails
+    # The Scrum cycle is valid once Gmail confirms
+    # that the message itself was sent.
     # -----------------------------------------------------
 
     if not sent_message_id:
@@ -2017,30 +2000,9 @@ def process_scheduled_active_resident(
                 message_level,
         }
 
-    if not sent_thread_id:
-        return {
-            "resident_id":
-                resident["resident_id"],
-            "assignment_id":
-                assignment["assignment_id"],
-            "backlog_id":
-                backlog["backlog_id"],
-            "action":
-                "failed",
-            "reason":
-                "scrum_thread_not_confirmed",
-            "message_level":
-                message_level,
-            "sent_message_id":
-                sent_message_id,
-        }
-
     # -----------------------------------------------------
-    # Successful Scrum cycle.
-    #
-    # 1. Decrement communication counter.
-    # 2. Store this Scrum's Gmail thread ID.
-    # 3. Open exactly one recovery opportunity.
+    # Successful Scrum cycle:
+    # decrement the communication counter by one.
     # -----------------------------------------------------
 
     new_counter = (
@@ -2053,10 +2015,6 @@ def process_scheduled_active_resident(
                 resident["sheet_row"],
             counter=
                 new_counter,
-            scrum_thread_id=
-                sent_thread_id,
-            scrum_replied=
-                False,
         )
     )
 
@@ -2073,10 +2031,6 @@ def process_scheduled_active_resident(
             message_level,
         "sent_message_id":
             sent_message_id,
-        "scrum_thread_id":
-            sent_thread_id,
-        "scrum_replied":
-            False,
         "old_counter":
             counter,
         "new_counter":
@@ -2682,9 +2636,9 @@ def get_new_message_ids(
 #
 # This is the inbound state router.
 #
-# Resident communication state is preserved here so
-# downstream lifecycle handlers can determine whether an
-# incoming reply belongs to the current Scrum cycle.
+# Resident status and Counter are authoritative here.
+# Gmail thread metadata is used only to keep replies in
+# the same conversation.
 # =========================================================
 
 def process_message(message_id):
@@ -2720,6 +2674,25 @@ def process_message(message_id):
                 message_id,
             "action":
                 "non_inbox_ignored",
+        }
+
+    sender_email = message["sender_email"].strip().lower()
+
+    if (
+        sender_email.startswith("mailer-daemon@")
+        or sender_email.startswith("postmaster@")
+    ):
+        processed_message_ids.add(
+            message_id
+        )
+
+        return {
+            "message_id":
+                message_id,
+            "sender_email":
+                message["sender_email"],
+            "action":
+                "system_email_ignored",
         }
 
     authorization = (
@@ -2769,8 +2742,7 @@ def process_message(message_id):
     # -----------------------------------------------------
     # Diagnostic copy of the latest authorized email.
     #
-    # Include current Scrum state so testing endpoints
-    # can show exactly what the inbound router received.
+    # Show the current resident state received by the router.
     # -----------------------------------------------------
 
     latest_authorized_email = {
@@ -2790,10 +2762,6 @@ def process_message(message_id):
             authorization["counter"],
         "mentor":
             authorization["mentor"],
-        "scrum_thread_id":
-            authorization["scrum_thread_id"],
-        "scrum_replied":
-            authorization["scrum_replied"],
         "sheet_row":
             authorization["sheet_row"],
         "subject":
@@ -2808,12 +2776,6 @@ def process_message(message_id):
 
     # -----------------------------------------------------
     # Resident context passed to lifecycle handlers.
-    #
-    # IMPORTANT:
-    # Scrum_Thread_ID and Scrum_Replied must travel with
-    # the resident context. Without them, ACTIVE reply
-    # processing cannot determine whether communication
-    # recovery should be awarded.
     # -----------------------------------------------------
 
     resident = {
@@ -2829,10 +2791,6 @@ def process_message(message_id):
             authorization["counter"],
         "mentor":
             authorization["mentor"],
-        "scrum_thread_id":
-            authorization["scrum_thread_id"],
-        "scrum_replied":
-            authorization["scrum_replied"],
         "sheet_row":
             authorization["sheet_row"],
     }
@@ -2871,17 +2829,9 @@ def process_message(message_id):
     # -----------------------------------------------------
     # ACTIVE -> Scrum interaction
     #
-    # process_active_reply() now receives:
-    #
-    # - current Counter
-    # - current Scrum_Thread_ID
-    # - current Scrum_Replied state
-    #
-    # This allows it to enforce:
-    #
-    # - one recovery point per Scrum cycle
-    # - no multiple-reply recovery
-    # - no backdated Scrum recovery
+    # Any successfully processed ACTIVE resident email
+    # is acknowledged in the same Gmail thread and
+    # restores Counter directly to 2.
     # -----------------------------------------------------
 
     if authorization["status"] == "ACTIVE":
@@ -3560,10 +3510,16 @@ def start_gmail_watch():
         .execute()
     )
 
-    last_history_id = (
+    history_id = (
         result.get(
             "historyId"
         )
+    )
+
+    last_history_id = (
+        int(history_id)
+        if history_id is not None
+        else None
     )
 
     return {
