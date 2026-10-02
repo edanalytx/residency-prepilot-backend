@@ -127,14 +127,6 @@ def get_sheets_service():
 # D = Status
 # E = Counter
 # F = Mentor
-# G = Scrum_Thread_ID
-# H = Scrum_Replied
-#
-# Scrum_Replied:
-# - FALSE / blank = current Scrum cycle has not yet
-#   received communication recovery credit.
-# - TRUE = recovery credit has already been awarded
-#   for the current Scrum cycle.
 # =========================================================
 
 VALID_RESIDENT_STATUSES = {
@@ -157,7 +149,7 @@ def get_residents():
         .get(
             spreadsheetId=
                 RESIDENT_REGISTRY_SPREADSHEET_ID,
-            range="Approved_Residents!A:H",
+            range="Approved_Residents!A:F",
         )
         .execute()
     )
@@ -209,18 +201,6 @@ def get_residents():
             else ""
         )
 
-        scrum_thread_id = (
-            row[6].strip()
-            if len(row) > 6
-            else ""
-        )
-
-        scrum_replied_raw = (
-            row[7].strip().upper()
-            if len(row) > 7
-            else ""
-        )
-
         try:
             counter = (
                 int(counter_raw)
@@ -229,10 +209,6 @@ def get_residents():
             )
         except ValueError:
             counter = None
-
-        scrum_replied = (
-            scrum_replied_raw == "TRUE"
-        )
 
         residents.append({
             "resident_id":
@@ -247,10 +223,6 @@ def get_residents():
                 counter,
             "mentor":
                 mentor,
-            "scrum_thread_id":
-                scrum_thread_id,
-            "scrum_replied":
-                scrum_replied,
             "sheet_row":
                 sheet_row,
         })
@@ -306,10 +278,6 @@ def authorize_sender(
             resident["counter"],
         "mentor":
             resident["mentor"],
-        "scrum_thread_id":
-            resident["scrum_thread_id"],
-        "scrum_replied":
-            resident["scrum_replied"],
         "sheet_row":
             resident["sheet_row"],
     }
@@ -320,18 +288,12 @@ def authorize_sender(
 #
 # Optional fields are updated only when explicitly
 # provided.
-#
-# Scrum fields:
-# G = Scrum_Thread_ID
-# H = Scrum_Replied
 # =========================================================
 
 def update_resident_state(
     sheet_row,
     status=None,
     counter=None,
-    scrum_thread_id=None,
-    scrum_replied=None,
 ):
     if status is not None:
         status = (
@@ -380,41 +342,6 @@ def update_resident_state(
         })
 
     # -----------------------------------------------------
-    # Current Scrum Gmail thread
-    #
-    # Passing an empty string intentionally clears
-    # the current Scrum thread.
-    # -----------------------------------------------------
-
-    if scrum_thread_id is not None:
-        updates.append({
-            "range":
-                f"Approved_Residents!"
-                f"G{sheet_row}",
-            "values":
-                [[str(scrum_thread_id)]],
-        })
-
-    # -----------------------------------------------------
-    # Current Scrum recovery status
-    # -----------------------------------------------------
-
-    if scrum_replied is not None:
-        scrum_replied_value = (
-            "TRUE"
-            if bool(scrum_replied)
-            else "FALSE"
-        )
-
-        updates.append({
-            "range":
-                f"Approved_Residents!"
-                f"H{sheet_row}",
-            "values":
-                [[scrum_replied_value]],
-        })
-
-    # -----------------------------------------------------
     # Nothing to update
     # -----------------------------------------------------
 
@@ -455,6 +382,8 @@ def update_resident_state(
                 0,
             ),
     }
+
+
 # =========================================================
 # Backlog Catalog
 #
